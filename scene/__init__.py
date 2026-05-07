@@ -49,15 +49,6 @@ class Scene:
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.extension)
             dataset_type="blender"
-        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval)
-            dataset_type="dynerf"
-        elif os.path.exists(os.path.join(args.source_path,"dataset.json")):
-            scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, False, args.eval)
-            dataset_type="nerfies"
-        elif os.path.exists(os.path.join(args.source_path,"train_meta.json")):
-            scene_info = sceneLoadTypeCallbacks["PanopticSports"](args.source_path)
-            dataset_type="PanopticSports"
         elif os.path.exists(os.path.join(args.source_path,"points3D_multipleview.ply")):
             scene_info = sceneLoadTypeCallbacks["MultipleView"](args.source_path)
             dataset_type="MultipleView"
@@ -80,7 +71,9 @@ class Scene:
             print("add points.")
             # breakpoint()
             scene_info = scene_info._replace(point_cloud=add_points(scene_info.point_cloud, xyz_max=xyz_max, xyz_min=xyz_min))
-        self.gaussians._deformation.deformation_net.set_aabb(xyz_max,xyz_min)
+        # ODE model: set spatial AABB (no-op for ODE, kept for interface compatibility)
+        if hasattr(self.gaussians, '_deformation'):
+            self.gaussians._deformation.deformation_net.set_aabb(xyz_max, xyz_min)
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",

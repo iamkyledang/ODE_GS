@@ -1,231 +1,171 @@
-import functools
-import math
-import os
-import time
-from tkinter import W
+"""
+ODE utility functions for dynamic 4D Gaussian Splatting.
 
-import numpy as np
+Implements the closed-form / matrix-exponential solvers described in:
+  "Dynamic 3D Gaussian Splatting with Explicit Real-Valued ODE-Based
+   Mean and Covariance Evolution"
+
+Mean evolution (3D real-valued ODE):
+  dx/dtau = A*x + b,   A in R^{3x3}, b in R^3, x(0) = x0
+  Solved via augmented 4x4 matrix exponential.
+
+Covariance evolution:
+  Log-scale:   ds_j/dtau = kappa_j  =>  s_j(tau) = s_j^0 + kappa_j * tau
+  Orientation: dR/dtau  = omega_hat * R,  omega in R^3
+               => R(tau) = exp(omega_hat * tau) * R^0   (SO(3) exponential)
+
+All functions operate on batches of N Gaussians and are fully differentiable.
+"""
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
-from utils.graphics_utils import apply_rotation, batch_quaternion_multiply
-from scene.hexplane import HexPlaneField
-from scene.grid import DenseGrid
-# from scene.grid import HashHexPlane
-class Deformation(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=27, input_ch_time=9, grid_pe=0, skips=[], args=None):
-        super(Deformation, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.input_ch_time = input_ch_time
-        self.skips = skips
-        self.grid_pe = grid_pe
-        self.no_grid = args.no_grid
-        self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
-        # breakpoint()
-        self.args = args
-        # self.args.empty_voxel=True
-        if self.args.empty_voxel:
-            self.empty_voxel = DenseGrid(channels=1, world_size=[64,64,64])
-        if self.args.static_mlp:
-            self.static_mlp = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
-        
-        self.ratio=0
-        self.create_net()
-    @property
-    def get_aabb(self):
-        return self.grid.get_aabb
-    def set_aabb(self, xyz_max, xyz_min):
-        print("Deformation Net Set aabb",xyz_max, xyz_min)
-        self.grid.set_aabb(xyz_max, xyz_min)
-        if self.args.empty_voxel:
-            self.empty_voxel.set_aabb(xyz_max, xyz_min)
-    def create_net(self):
-        mlp_out_dim = 0
-        if self.grid_pe !=0:
-            
-            grid_out_dim = self.grid.feat_dim+(self.grid.feat_dim)*2 
-        else:
-            grid_out_dim = self.grid.feat_dim
-        if self.no_grid:
-            self.feature_out = [nn.Linear(4,self.W)]
-        else:
-            self.feature_out = [nn.Linear(mlp_out_dim + grid_out_dim ,self.W)]
-        
-        for i in range(self.D-1):
-            self.feature_out.append(nn.ReLU())
-            self.feature_out.append(nn.Linear(self.W,self.W))
-        self.feature_out = nn.Sequential(*self.feature_out)
-        self.pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
-        self.scales_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
-        self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
-        self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
-        self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
 
-    def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
-        if self.no_grid:
-            h = torch.cat([rays_pts_emb[:,:3],time_emb[:,:1]],-1)
-        else:
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
 
-            grid_feature = self.grid(rays_pts_emb[:,:3], time_emb[:,:1])
-            # breakpoint()
-            if self.grid_pe > 1:
-                grid_feature = poc_fre(grid_feature,self.grid_pe)
-            hidden = torch.cat([grid_feature],-1) 
-        
-        
-        hidden = self.feature_out(hidden)   
- 
+def quaternion_to_rotation_matrix(q: torch.Tensor) -> torch.Tensor:
+    """
+    Convert unit quaternions to rotation matrices.
 
-        return hidden
-    @property
-    def get_empty_ratio(self):
-        return self.ratio
-    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None):
-        if time_emb is None:
-            return self.forward_static(rays_pts_emb[:,:3])
-        else:
-            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb)
+    Args:
+        q: (N, 4) unit quaternions in [w, x, y, z] convention.
+    Returns:
+        R: (N, 3, 3) rotation matrices.
+    """
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    R = torch.stack([
+        1 - 2*(y*y + z*z),  2*(x*y - z*w),      2*(x*z + y*w),
+        2*(x*y + z*w),      1 - 2*(x*x + z*z),   2*(y*z - x*w),
+        2*(x*z - y*w),      2*(y*z + x*w),        1 - 2*(x*x + y*y),
+    ], dim=-1).reshape(-1, 3, 3)
+    return R
 
-    def forward_static(self, rays_pts_emb):
-        grid_feature = self.grid(rays_pts_emb[:,:3])
-        dx = self.static_mlp(grid_feature)
-        return rays_pts_emb[:, :3] + dx
-    def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
-        hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
-        if self.args.static_mlp:
-            mask = self.static_mlp(hidden)
-        elif self.args.empty_voxel:
-            mask = self.empty_voxel(rays_pts_emb[:,:3])
-        else:
-            mask = torch.ones_like(opacity_emb[:,0]).unsqueeze(-1)
-        # breakpoint()
-        if self.args.no_dx:
-            pts = rays_pts_emb[:,:3]
-        else:
-            dx = self.pos_deform(hidden)
-            pts = torch.zeros_like(rays_pts_emb[:,:3])
-            pts = rays_pts_emb[:,:3]*mask + dx
-        if self.args.no_ds :
-            
-            scales = scales_emb[:,:3]
-        else:
-            ds = self.scales_deform(hidden)
 
-            scales = torch.zeros_like(scales_emb[:,:3])
-            scales = scales_emb[:,:3]*mask + ds
-            
-        if self.args.no_dr :
-            rotations = rotations_emb[:,:4]
-        else:
-            dr = self.rotations_deform(hidden)
+def quaternion_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    Hamilton product of two quaternion tensors.
 
-            rotations = torch.zeros_like(rotations_emb[:,:4])
-            if self.args.apply_rotation:
-                rotations = batch_quaternion_multiply(rotations_emb, dr)
-            else:
-                rotations = rotations_emb[:,:4] + dr
+    Args:
+        q1, q2: (N, 4) quaternions in [w, x, y, z] convention.
+    Returns:
+        (N, 4) product quaternion q1 * q2.
+    """
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
 
-        if self.args.no_do :
-            opacity = opacity_emb[:,:1] 
-        else:
-            do = self.opacity_deform(hidden) 
-          
-            opacity = torch.zeros_like(opacity_emb[:,:1])
-            opacity = opacity_emb[:,:1]*mask + do
-        if self.args.no_dshs:
-            shs = shs_emb
-        else:
-            dshs = self.shs_deform(hidden).reshape([shs_emb.shape[0],16,3])
 
-            shs = torch.zeros_like(shs_emb)
-            # breakpoint()
-            shs = shs_emb*mask.unsqueeze(-1) + dshs
+# ---------------------------------------------------------------------------
+# Mean ODE: 3D real-valued closed-form solver via matrix exponential
+# ---------------------------------------------------------------------------
 
-        return pts, scales, rotations, opacity, shs
-    def get_mlp_parameters(self):
-        parameter_list = []
-        for name, param in self.named_parameters():
-            if  "grid" not in name:
-                parameter_list.append(param)
-        return parameter_list
-    def get_grid_parameters(self):
-        parameter_list = []
-        for name, param in self.named_parameters():
-            if  "grid" in name:
-                parameter_list.append(param)
-        return parameter_list
-class deform_network(nn.Module):
-    def __init__(self, args) :
-        super(deform_network, self).__init__()
-        net_width = args.net_width
-        timebase_pe = args.timebase_pe
-        defor_depth= args.defor_depth
-        posbase_pe= args.posebase_pe
-        scale_rotation_pe = args.scale_rotation_pe
-        opacity_pe = args.opacity_pe
-        timenet_width = args.timenet_width
-        timenet_output = args.timenet_output
-        grid_pe = args.grid_pe
-        times_ch = 2*timebase_pe+1
-        self.timenet = nn.Sequential(
-        nn.Linear(times_ch, timenet_width), nn.ReLU(),
-        nn.Linear(timenet_width, timenet_output))
-        self.deformation_net = Deformation(W=net_width, D=defor_depth, input_ch=(3)+(3*(posbase_pe))*2, grid_pe=grid_pe, input_ch_time=timenet_output, args=args)
-        self.register_buffer('time_poc', torch.FloatTensor([(2**i) for i in range(timebase_pe)]))
-        self.register_buffer('pos_poc', torch.FloatTensor([(2**i) for i in range(posbase_pe)]))
-        self.register_buffer('rotation_scaling_poc', torch.FloatTensor([(2**i) for i in range(scale_rotation_pe)]))
-        self.register_buffer('opacity_poc', torch.FloatTensor([(2**i) for i in range(opacity_pe)]))
-        self.apply(initialize_weights)
-        # print(self)
+def solve_3d_ode(
+    A_flat: torch.Tensor,   # (N, 9)   row-major 3x3 dynamics matrix A
+    b_vec:  torch.Tensor,   # (N, 3)   constant forcing / drift vector b
+    x0:     torch.Tensor,   # (N, 3)   initial 3D displacement x(0) = x0
+    tau:    float,
+) -> torch.Tensor:
+    """
+    Solve the real-valued 3D affine ODE:
+        dx/dtau = A*x + b,   x(0) = x0,   A in R^{3x3}, b in R^3
 
-    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
-        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)
-    @property
-    def get_aabb(self):
-        
-        return self.deformation_net.get_aabb
-    @property
-    def get_empty_ratio(self):
-        return self.deformation_net.get_empty_ratio
-        
-    def forward_static(self, points):
-        points = self.deformation_net(points)
-        return points
-    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
-        # times_emb = poc_fre(times_sel, self.time_poc)
-        point_emb = poc_fre(point,self.pos_poc)
-        scales_emb = poc_fre(scales,self.rotation_scaling_poc)
-        rotations_emb = poc_fre(rotations,self.rotation_scaling_poc)
-        # time_emb = poc_fre(times_sel, self.time_poc)
-        # times_feature = self.timenet(time_emb)
-        means3D, scales, rotations, opacity, shs = self.deformation_net( point_emb,
-                                                  scales_emb,
-                                                rotations_emb,
-                                                opacity,
-                                                shs,
-                                                None,
-                                                times_sel)
-        return means3D, scales, rotations, opacity, shs
-    def get_mlp_parameters(self):
-        return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
-    def get_grid_parameters(self):
-        return self.deformation_net.get_grid_parameters()
+    Solved via the augmented 4x4 system:
+        d/dtau [x; 1] = [[A, b], [0, 0]] @ [x; 1]
+    => [x(tau); 1] = expm([[A, b], [0, 0]] * tau) @ [x0; 1]
 
-def initialize_weights(m):
-    if isinstance(m, nn.Linear):
-        # init.constant_(m.weight, 0)
-        init.xavier_uniform_(m.weight,gain=1)
-        if m.bias is not None:
-            init.xavier_uniform_(m.weight,gain=1)
-            # init.constant_(m.bias, 0)
-def poc_fre(input_data,poc_buf):
+    This avoids inverting A and correctly handles the A=0 (linear drift) case
+    as a special case of the general exponential solution.
 
-    input_data_emb = (input_data.unsqueeze(-1) * poc_buf).flatten(-2)
-    input_data_sin = input_data_emb.sin()
-    input_data_cos = input_data_emb.cos()
-    input_data_emb = torch.cat([input_data, input_data_sin,input_data_cos], -1)
-    return input_data_emb
+    Args:
+        A_flat: (N, 9) row-major 3x3 dynamics matrix.
+        b_vec:  (N, 3) constant drift term.
+        x0:     (N, 3) initial 3D displacement at tau=0.
+        tau:    scalar time in [-1, 1].
+
+    Returns:
+        x_tau: (N, 3) 3D displacement at time tau.
+    """
+    N      = x0.shape[0]
+    device = x0.device
+    dtype  = x0.dtype
+
+    A = A_flat.reshape(N, 3, 3)
+
+    # Build augmented 4x4 system: [[A, b], [0, 0, 0, 0]]
+    aug = torch.zeros(N, 4, 4, device=device, dtype=dtype)
+    aug[:, :3, :3] = A
+    aug[:, :3,  3] = b_vec
+
+    # Matrix exponential of the augmented system scaled by tau
+    exp_aug = torch.matrix_exp(aug * tau)   # (N, 4, 4)
+
+    # Augmented state vector [x0; 1]
+    state = torch.cat([x0, torch.ones(N, 1, device=device, dtype=dtype)], dim=-1)  # (N, 4)
+
+    # x(tau) is the first three components of exp_aug @ [x0; 1]
+    x_tau = torch.bmm(exp_aug, state.unsqueeze(-1)).squeeze(-1)[:, :3]             # (N, 3)
+    return x_tau
+
+
+# ---------------------------------------------------------------------------
+# Covariance ODE solver: scale + SO(3) orientation
+# ---------------------------------------------------------------------------
+
+def evolve_covariance(
+    scaling_log_canonical: torch.Tensor,   # (N, 3)  canonical log-scales
+    rotation_q_canonical:  torch.Tensor,   # (N, 4)  canonical quaternion [w,x,y,z]
+    kappa:                 torch.Tensor,   # (N, 3)  log-scale rate
+    omega_cov:             torch.Tensor,   # (N, 3)  angular velocity in R^3
+    tau:                   float,
+) -> tuple:
+    """
+    Compute deformed log-scales and quaternion at normalized time tau.
+
+    Scale ODE (explicit closed form):
+        ds_j/dtau = kappa_j  =>  s_j(tau) = s_j^0 + kappa_j * tau
+
+    Orientation ODE in SO(3) (Rodrigues formula):
+        dR/dtau = omega_hat * R,   omega in R^3
+        => R(tau) = exp(omega_hat * tau) * R^0
+
+    The rotation delta exp(omega_hat * tau) is computed as a quaternion:
+        theta = ||omega|| * tau
+        q_delta = [cos(theta/2), sin(theta/2) * omega/||omega||]
+
+    Args:
+        scaling_log_canonical: (N, 3) log-scale parameters at tau=0.
+        rotation_q_canonical:  (N, 4) quaternion [w,x,y,z] at tau=0.
+        kappa:     (N, 3) per-Gaussian log-scale rate parameters.
+        omega_cov: (N, 3) per-Gaussian angular velocity (SO(3) generator).
+        tau:       scalar time in [-1, 1].
+
+    Returns:
+        scaling_log_t: (N, 3) log-scales at time tau.
+        rotation_q_t:  (N, 4) unit quaternion at time tau.
+    """
+    # Linear scale evolution: s(tau) = s^0 + kappa * tau
+    scaling_log_t = scaling_log_canonical + kappa * tau
+
+    # SO(3) rotation delta via Rodrigues formula
+    # theta = ||omega|| * tau  (signed rotation angle)
+    omega_norm = torch.norm(omega_cov, dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
+    axis       = omega_cov / omega_norm                                         # (N, 3) unit axis
+    angle      = omega_norm.squeeze(-1) * tau                                   # (N,)
+
+    # Convert axis-angle to quaternion: q = [cos(a/2), sin(a/2)*axis]
+    c       = torch.cos(angle / 2).unsqueeze(-1)  # (N, 1)
+    s       = torch.sin(angle / 2).unsqueeze(-1)  # (N, 1)
+    q_delta = torch.cat([c, s * axis], dim=-1)    # (N, 4)
+
+    # Compose: q(tau) = q_delta * q^0  (delta applied first in world frame)
+    q_total      = quaternion_multiply(q_delta, rotation_q_canonical)
+    rotation_q_t = F.normalize(q_total, dim=-1)
+
+    return scaling_log_t, rotation_q_t

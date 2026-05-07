@@ -26,6 +26,11 @@ class FourDGSdataset(Dataset):
                 FovX = focal2fov(self.dataset.focal[0], image.shape[2])
                 FovY = focal2fov(self.dataset.focal[0], image.shape[1])
                 mask=None
+                # Use camera name if available (multipleview datasets expose image_cam_names)
+                if hasattr(self.dataset, 'image_cam_names'):
+                    image_name = self.dataset.image_cam_names[index]
+                else:
+                    image_name = f"{index}"
             except:
                 caminfo = self.dataset[index]
                 image = caminfo.image
@@ -34,10 +39,10 @@ class FourDGSdataset(Dataset):
                 FovX = caminfo.FovX
                 FovY = caminfo.FovY
                 time = caminfo.time
-    
                 mask = caminfo.mask
+                image_name = getattr(caminfo, 'image_name', f"{index}")
             return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
-                              image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
+                              image_name=image_name,uid=index,data_device=torch.device("cuda"),time=time,
                               mask=mask)
         else:
             return self.dataset[index]

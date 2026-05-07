@@ -262,10 +262,25 @@ class Neural3D_NDC_Dataset(Dataset):
         poses_arr = np.load(os.path.join(self.root_dir, "poses_bounds.npy"))
         poses = poses_arr[:, :-2].reshape([-1, 3, 5])  # (N_cams, 3, 5)
         self.near_fars = poses_arr[:, -2:]
-        videos = glob.glob(os.path.join(self.root_dir, "cam*.mp4"))
-        videos = sorted(videos)
-        # breakpoint()
-        assert len(videos) == poses_arr.shape[0]
+
+        # videos = glob.glob(os.path.join(self.root_dir, "cam*.mp4"))
+        # videos = sorted(videos)
+        # # breakpoint()
+        # assert len(videos) == poses_arr.shape[0]
+
+        videos = sorted([
+            os.path.join(self.root_dir, d)
+            for d in os.listdir(self.root_dir)
+            if d.startswith("cam") and os.path.isdir(os.path.join(self.root_dir, d))
+        ])
+
+        print("camera folders found:", [os.path.basename(v) for v in videos])
+        print("num camera folders:", len(videos))
+        print("poses_arr shape:", poses_arr.shape)
+
+        assert len(videos) == poses_arr.shape[0], \
+            f"Found {len(videos)} camera folders but poses_bounds.npy has {poses_arr.shape[0]} poses"
+
 
         H, W, focal = poses[0, :, -1]
         focal = focal / self.downsample
@@ -317,33 +332,47 @@ class Neural3D_NDC_Dataset(Dataset):
                 if split == "test":
                     continue
             N_cams +=1
+            # count = 0
+            # video_images_path = video_path.split('.')[0]
+            # image_path = os.path.join(video_images_path,"images")
+            # video_frames = cv2.VideoCapture(video_path)
+            # if not os.path.exists(image_path):
+            #     print(f"no images saved in {image_path}, extract images from video.")
+            #     os.makedirs(image_path)
+            #     this_count = 0
+            #     while video_frames.isOpened():
+            #         ret, video_frame = video_frames.read()
+            #         if this_count >= countss:break
+            #         if ret:
+            #             video_frame = cv2.cvtColor(video_frame, cv2.COLOR_BGR2RGB)
+            #             video_frame = Image.fromarray(video_frame)
+            #             if self.downsample != 1.0:
+
+            #                 img = video_frame.resize(self.img_wh, Image.LANCZOS)
+            #             img.save(os.path.join(image_path,"%04d.png"%count))
+
+            #             # img = transform(img)
+            #             count += 1
+            #             this_count+=1
+            #         else:
+            #             break
+
             count = 0
-            video_images_path = video_path.split('.')[0]
-            image_path = os.path.join(video_images_path,"images")
-            video_frames = cv2.VideoCapture(video_path)
+            # image_path = video_path   # frames are directly inside cam00/, cam01/, ...
+            image_path = os.path.join(video_path, "images")
+
+
             if not os.path.exists(image_path):
-                print(f"no images saved in {image_path}, extract images from video.")
-                os.makedirs(image_path)
-                this_count = 0
-                while video_frames.isOpened():
-                    ret, video_frame = video_frames.read()
-                    if this_count >= countss:break
-                    if ret:
-                        video_frame = cv2.cvtColor(video_frame, cv2.COLOR_BGR2RGB)
-                        video_frame = Image.fromarray(video_frame)
-                        if self.downsample != 1.0:
-
-                            img = video_frame.resize(self.img_wh, Image.LANCZOS)
-                        img.save(os.path.join(image_path,"%04d.png"%count))
-
-                        # img = transform(img)
-                        count += 1
-                        this_count+=1
-                    else:
-                        break
+                raise FileNotFoundError(f"Expected frames in {image_path}")
                     
-            images_path = os.listdir(image_path)
-            images_path.sort()
+            # images_path = os.listdir(image_path)
+            # images_path.sort()
+
+            images_path = sorted([
+                f for f in os.listdir(image_path)
+                if f.lower().endswith((".png", ".jpg", ".jpeg"))
+            ])
+
             this_count = 0
             for idx, path in enumerate(images_path):
                 if this_count >=countss:break

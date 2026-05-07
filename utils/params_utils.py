@@ -1,5 +1,6 @@
 def merge_hparams(args, config):
-    params = ["OptimizationParams", "ModelHiddenParams", "ModelParams", "PipelineParams"]
+    params = ["OptimizationParams", "ModelHiddenParams", "ModelParams", "PipelineParams",
+              "ODEModelParams", "ODEOptimizationParams"]
     for param in params:
         if param in config.keys():
             for key, value in config[param].items():

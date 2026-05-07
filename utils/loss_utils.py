@@ -65,3 +65,75 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+
+# ---------------------------------------------------------------------------
+# ODE-specific losses  (used by train_ode.py)
+# ---------------------------------------------------------------------------
+
+def flow_consistency_loss(flow_rendered: torch.Tensor, flow_gt: torch.Tensor) -> torch.Tensor:
+    """
+    Optical flow consistency loss.
+
+    Penalises the L1 difference between the optical flow estimated from
+    consecutive *rendered* frames and the flow estimated from consecutive
+    *ground-truth* frames.  Both flow tensors should already be estimated
+    externally (e.g. via RAFT or TV-L1) before being passed here.
+
+    This corresponds to:
+        L_flow = sum_t ||F_hat_{t->t+1} - F_{t->t+1}||_1
+
+    as described in the framework document.
+
+    Args:
+        flow_rendered : (..., 2, H, W) optical flow from rendered images.
+        flow_gt       : (..., 2, H, W) optical flow from ground-truth images.
+
+    Returns:
+        Scalar L1 loss.
+    """
+    return torch.abs(flow_rendered - flow_gt).mean()
+
+
+def ode_trajectory_reg_loss(
+    velocities: torch.Tensor,
+    accelerations: torch.Tensor,
+    lambda_vel: float = 1.0,
+    lambda_acc: float = 0.1,
+) -> torch.Tensor:
+    """
+    Trajectory smoothness regularisation computed from sampled velocity and
+    acceleration tensors (obtained from GaussianModel.get_velocity_and_acceleration).
+
+    Penalises high velocity and acceleration of Gaussian centres, encouraging
+    smooth, physically plausible trajectories.
+
+    Args:
+        velocities    : (T-1, N, 3) per-Gaussian velocity across T-1 intervals.
+        accelerations : (T-2, N, 3) per-Gaussian acceleration across T-2 intervals.
+        lambda_vel    : weight for velocity term.
+        lambda_acc    : weight for acceleration term.
+
+    Returns:
+        Scalar regularisation loss.
+    """
+    vel_loss = (velocities ** 2).mean()
+    acc_loss = (accelerations ** 2).mean()
+    return lambda_vel * vel_loss + lambda_acc * acc_loss
+
+
+def jitter_heatmap(velocities: torch.Tensor) -> torch.Tensor:
+    """
+    Per-Gaussian jitter score used for visualisation.
+
+    Jitter is defined as the standard deviation of velocity magnitude across
+    time steps.  High jitter indicates unstable / oscillating trajectories.
+
+    Args:
+        velocities : (T-1, N, 3) velocity tensor from get_velocity_and_acceleration.
+
+    Returns:
+        jitter : (N,) per-Gaussian jitter score (unnormalised).
+    """
+    speed = velocities.norm(dim=-1)   # (T-1, N)
+    return speed.std(dim=0)           # (N,)
+

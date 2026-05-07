@@ -17,9 +17,6 @@ from scene.cameras import Camera
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
-from scene.hyper_loader import Load_hyper_data, format_hyper_data
-import torchvision.transforms as transforms
-import copy
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import torch
@@ -27,7 +24,7 @@ import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
-from scene.gaussian_model import BasicPointCloud
+from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import PILtoTorch
 from tqdm import tqdm
 class CameraInfo(NamedTuple):
@@ -370,59 +367,6 @@ def format_infos(dataset,split):
     return cameras
 
 
-def readHyperDataInfos(datadir,use_bg_points,eval):
-    train_cam_infos = Load_hyper_data(datadir,0.5,use_bg_points,split ="train")
-    test_cam_infos = Load_hyper_data(datadir,0.5,use_bg_points,split="test")
-    print("load finished")
-    train_cam = format_hyper_data(train_cam_infos,"train")
-    print("format finished")
-    max_time = train_cam_infos.max_time
-    video_cam_infos = copy.deepcopy(test_cam_infos)
-    video_cam_infos.split="video"
-
-
-    ply_path = os.path.join(datadir, "points3D_downsample2.ply")
-    pcd = fetchPly(ply_path)
-    xyz = np.array(pcd.points)
-
-    pcd = pcd._replace(points=xyz)
-    nerf_normalization = getNerfppNorm(train_cam)
-    plot_camera_orientations(train_cam_infos, pcd.points)
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           video_cameras=video_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           maxtime=max_time
-                           )
-
-    return scene_info
-def format_render_poses(poses,data_infos):
-    cameras = []
-    tensor_to_pil = transforms.ToPILImage()
-    len_poses = len(poses)
-    times = [i/len_poses for i in range(len_poses)]
-    image = data_infos[0][0]
-    for idx, p in tqdm(enumerate(poses)):
-        # image = None
-        image_path = None
-        image_name = f"{idx}"
-        time = times[idx]
-        pose = np.eye(4)
-        pose[:3,:] = p[:3,:]
-        # matrix = np.linalg.inv(np.array(pose))
-        R = pose[:3,:3]
-        R = - R
-        R[:,0] = -R[:,0]
-        T = -pose[:3,3].dot(R)
-        FovX = focal2fov(data_infos.focal[0], image.shape[2])
-        FovY = focal2fov(data_infos.focal[0], image.shape[1])
-        cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                            time = time, mask=None))
-    return cameras
-
 def add_points(pointsclouds, xyz_min, xyz_max):
     add_points = (np.random.random((100000, 3)))* (xyz_max-xyz_min) + xyz_min
     add_points = add_points.astype(np.float32)
@@ -438,167 +382,18 @@ def add_points(pointsclouds, xyz_min, xyz_max):
     return pointsclouds
     # breakpoint()
     # new_
-def readdynerfInfo(datadir,use_bg_points,eval):
-    # loading all the data follow hexplane format
-    # ply_path = os.path.join(datadir, "points3D_dense.ply")
-    ply_path = os.path.join(datadir, "points3D_downsample2.ply")
-    from scene.neural_3D_dataset_NDC import Neural3D_NDC_Dataset
-    train_dataset = Neural3D_NDC_Dataset(
-    datadir,
-    "train",
-    1.0,
-    time_scale=1,
-    scene_bbox_min=[-2.5, -2.0, -1.0],
-    scene_bbox_max=[2.5, 2.0, 1.0],
-    eval_index=0,
-        )    
-    test_dataset = Neural3D_NDC_Dataset(
-    datadir,
-    "test",
-    1.0,
-    time_scale=1,
-    scene_bbox_min=[-2.5, -2.0, -1.0],
-    scene_bbox_max=[2.5, 2.0, 1.0],
-    eval_index=0,
-        )
-    train_cam_infos = format_infos(train_dataset,"train")
-    val_cam_infos = format_render_poses(test_dataset.val_poses,test_dataset)
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    # xyz = np.load
-    pcd = fetchPly(ply_path)
-    print("origin points,",pcd.points.shape[0])
-    
-    print("after points,",pcd.points.shape[0])
-
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_dataset,
-                           test_cameras=test_dataset,
-                           video_cameras=val_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           maxtime=300
-                           )
-    return scene_info
-
-def setup_camera(w, h, k, w2c, near=0.01, far=100):
-    from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
-    fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-    w2c = torch.tensor(w2c).cuda().float()
-    cam_center = torch.inverse(w2c)[:3, 3]
-    w2c = w2c.unsqueeze(0).transpose(1, 2)
-    opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
-                                [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
-                                [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
-                                [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
-    full_proj = w2c.bmm(opengl_proj)
-    cam = Camera(
-        image_height=h,
-        image_width=w,
-        tanfovx=w / (2 * fx),
-        tanfovy=h / (2 * fy),
-        bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
-        scale_modifier=1.0,
-        viewmatrix=w2c,
-        projmatrix=full_proj,
-        sh_degree=0,
-        campos=cam_center,
-        prefiltered=False,
-        debug=True
-    )
-    return cam
-def plot_camera_orientations(cam_list, xyz):
-    import matplotlib.pyplot as plt
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    # ax2 = fig.add_subplot(122, projection='3d')
-    # xyz = xyz[xyz[:,0]<1]
-    threshold=2
-    xyz = xyz[(xyz[:, 0] >= -threshold) & (xyz[:, 0] <= threshold) &
-                         (xyz[:, 1] >= -threshold) & (xyz[:, 1] <= threshold) &
-                         (xyz[:, 2] >= -threshold) & (xyz[:, 2] <= threshold)]
-
-    ax.scatter(xyz[:,0],xyz[:,1],xyz[:,2],c='r',s=0.1)
-    for cam in tqdm(cam_list):
-        # 提取 R 和 T
-        R = cam.R
-        T = cam.T
-
-        direction = R @ np.array([0, 0, 1])
-
-        ax.quiver(T[0], T[1], T[2], direction[0], direction[1], direction[2], length=1)
-
-    ax.set_xlabel('X Axis')
-    ax.set_ylabel('Y Axis')
-    ax.set_zlabel('Z Axis')
-    plt.savefig("output.png")
-    # breakpoint()
-def readPanopticmeta(datadir, json_path):
-    with open(os.path.join(datadir,json_path)) as f:
-        test_meta = json.load(f)
-    w = test_meta['w']
-    h = test_meta['h']
-    max_time = len(test_meta['fn'])
-    cam_infos = []
-    for index in range(len(test_meta['fn'])):
-        focals = test_meta['k'][index]
-        w2cs = test_meta['w2c'][index]
-        fns = test_meta['fn'][index]
-        cam_ids = test_meta['cam_id'][index]
-
-        time = index / len(test_meta['fn'])
-        for focal, w2c, fn, cam in zip(focals, w2cs, fns, cam_ids):
-            image_path = os.path.join(datadir,"ims")
-            image_name=fn
-            image = Image.open(os.path.join(datadir,"ims",fn))
-            im_data = np.array(image.convert("RGBA"))
-            im_data = PILtoTorch(im_data,None)[:3,:,:]
-            camera = setup_camera(w, h, focal, w2c)
-            cam_infos.append({
-                "camera":camera,
-                "time":time,
-                "image":im_data})
-            
-    cam_centers = np.linalg.inv(test_meta['w2c'][0])[:, :3, 3]  # Get scene radius
-    scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
-    return cam_infos, max_time, scene_radius 
-
-def readPanopticSportsinfos(datadir):
-    train_cam_infos, max_time, scene_radius = readPanopticmeta(datadir, "train_meta.json")
-    test_cam_infos,_, _ = readPanopticmeta(datadir, "test_meta.json")
-    nerf_normalization = {
-        "radius":scene_radius,
-        "translate":torch.tensor([0,0,0])
-    }
-
-    ply_path = os.path.join(datadir, "pointd3D.ply")
-
-        # Since this data set has no colmap data, we start with random points
-    plz_path = os.path.join(datadir, "init_pt_cld.npz")
-    data = np.load(plz_path)["data"]
-    xyz = data[:,:3]
-    rgb = data[:,3:6]
-    num_pts = xyz.shape[0]
-    pcd = BasicPointCloud(points=xyz, colors=rgb, normals=np.ones((num_pts, 3)))
-    storePly(ply_path, xyz, rgb)
-    # pcd = fetchPly(ply_path)
-    # breakpoint()
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           video_cameras=test_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           maxtime=max_time,
-                           )
-    return scene_info
-
 def readMultipleViewinfos(datadir,llffhold=8):
 
-    cameras_extrinsic_file = os.path.join(datadir, "sparse_/images.bin")
-    cameras_intrinsic_file = os.path.join(datadir, "sparse_/cameras.bin")
-    cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-    cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    cameras_extrinsic_file_bin = os.path.join(datadir, "sparse_/images.bin")
+    cameras_intrinsic_file_bin = os.path.join(datadir, "sparse_/cameras.bin")
+    cameras_extrinsic_file_txt = os.path.join(datadir, "sparse_/images.txt")
+    cameras_intrinsic_file_txt = os.path.join(datadir, "sparse_/cameras.txt")
+    if os.path.exists(cameras_extrinsic_file_bin):
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file_bin)
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file_bin)
+    else:
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file_txt)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file_txt)
     from scene.multipleview_dataset import multipleview_dataset
     train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="train")
     test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="test")
@@ -635,8 +430,5 @@ def readMultipleViewinfos(datadir,llffhold=8):
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "dynerf" : readdynerfInfo,
-    "nerfies": readHyperDataInfos,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
-    "PanopticSports" : readPanopticSportsinfos,
     "MultipleView": readMultipleViewinfos
 }
