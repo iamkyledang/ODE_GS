@@ -6,7 +6,7 @@ Extends [4D Gaussian Splatting (Wu et al., CVPR 2024)](https://guanjunwu.github.
 
 ## Installation
 
-Please follow the instruction bellow for installation
+Please follow the instruction bellow for installation:
 
 ```bash
 git clone https://github.com/iamkyledang/ODE_GS
