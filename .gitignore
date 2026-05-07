@@ -12,6 +12,7 @@ dist/
 #Data and output folder
 data/
 output/
+coffee_martini/
 
 # Submodule build artifacts
 submodules/simple-knn/build/
