@@ -1,0 +1,15 @@
+python train.py \
+  -s data/multipleview/coffee_martini \
+  -m output/multipleview/coffee_martini \
+  --expname multipleview/coffee_martini \
+  --dataloader
+
+python render.py \
+  -m output/multipleview/coffee_martini \
+  --model_class ode \
+  --skip_train \
+  --skip_video
+
+python metrics.py -m output/multipleview/coffee_martini
+
+python full_eval.py
