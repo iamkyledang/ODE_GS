@@ -1,147 +1,184 @@
-
 import os
-import numpy as np
-import glob
 import sys
-def rotmat2qvec(R):
+import glob
+import shutil
+import numpy as np
+
+
+def rotmat2qvec(R: np.ndarray) -> np.ndarray:
     Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
     K = np.array([
-        [Rxx - Ryy - Rzz, 0, 0, 0],
-        [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
-        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
-        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]]) / 3.0
+        [Rxx - Ryy - Rzz, 0.0, 0.0, 0.0],
+        [Ryx + Rxy, Ryy - Rxx - Rzz, 0.0, 0.0],
+        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0.0],
+        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz],
+    ]) / 3.0
+
     eigvals, eigvecs = np.linalg.eigh(K)
     qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
     if qvec[0] < 0:
         qvec *= -1
     return qvec
-def normalize(v):
-    """Normalize a vector."""
-    return v / np.linalg.norm(v)
 
-def average_poses(poses):
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def find_reference_image(cam_dir: str) -> str:
     """
-    Calculate the average pose, which is then used to center all poses
-    using @center_poses. Its computation is as follows:
-    1. Compute the center: the average of pose centers.
-    2. Compute the z axis: the normalized average z axis.
-    3. Compute axis y': the average y axis.
-    4. Compute x' = y' cross product z, then normalize it as the x axis.
-    5. Compute the y axis: z cross product x.
-
-    Note that at step 3, we cannot directly use y' as y axis since it's
-    not necessarily orthogonal to z axis. We need to pass from x to y.
-    Inputs:
-        poses: (N_images, 3, 4)
-    Outputs:
-        pose_avg: (3, 4) the average pose
+    Prefer 0000.png, then 0000.jpg, otherwise first image found.
     """
-    # 1. Compute the center
-    center = poses[..., 3].mean(0)  # (3)
+    preferred = [
+        os.path.join(cam_dir, "images", "0000.png"),
+        os.path.join(cam_dir, "images", "0000.jpg"),
+    ]
+    for p in preferred:
+        if os.path.isfile(p):
+            return p
 
-    # 2. Compute the z axis
-    z = normalize(poses[..., 2].mean(0))  # (3)
+    candidates = sorted(
+        glob.glob(os.path.join(cam_dir, "images", "*.png")) +
+        glob.glob(os.path.join(cam_dir, "images", "*.jpg")) +
+        glob.glob(os.path.join(cam_dir, "images", "*.jpeg"))
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No image found in {os.path.join(cam_dir, 'images')}")
+    return candidates[0]
 
-    # 3. Compute axis y' (no need to normalize as it's not the final output)
-    y_ = poses[..., 1].mean(0)  # (3)
 
-    # 4. Compute the x axis
-    x = normalize(np.cross(z, y_))  # (3)
-
-    # 5. Compute the y axis (as z and x are normalized, y is already of norm 1)
-    y = np.cross(x, z)  # (3)
-
-    pose_avg = np.stack([x, y, z, center], 1)  # (3, 4)
-
-    return pose_avg
-
-blender2opencv = np.eye(4)
-def center_poses(poses, blender2opencv):
+def llff_pose_to_colmap_extrinsic(pose_3x4: np.ndarray):
     """
-    Center the poses so that we can use NDC.
-    See https://github.com/bmild/nerf/issues/34
-    Inputs:
-        poses: (N_images, 3, 4)
-    Outputs:
-        poses_centered: (N_images, 3, 4) the centered poses
-        pose_avg: (3, 4) the average pose
+    Convert LLFF-style pose to COLMAP world->camera extrinsic.
+
+    Input pose_3x4 is assumed to come from:
+        poses = poses_arr[:, :-2].reshape([-1, 3, 5])
+    followed by:
+        poses = np.concatenate([poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1)
+
+    Returns:
+        qvec, tvec
     """
-    poses = poses @ blender2opencv
-    pose_avg = average_poses(poses)  # (3, 4)
-    pose_avg_homo = np.eye(4)
-    pose_avg_homo[
-        :3
-    ] = pose_avg  # convert to homogeneous coordinate for faster computation
-    pose_avg_homo = pose_avg_homo
-    # by simply adding 0, 0, 0, 1 as the last row
-    last_row = np.tile(np.array([0, 0, 0, 1]), (len(poses), 1, 1))  # (N_images, 1, 4)
-    poses_homo = np.concatenate(
-        [poses, last_row], 1
-    )  # (N_images, 4, 4) homogeneous coordinate
+    R_c2w = pose_3x4[:, :3].copy()
+    t_c2w = pose_3x4[:, 3].copy()
 
-    poses_centered = np.linalg.inv(pose_avg_homo) @ poses_homo  # (N_images, 4, 4)
-    #     poses_centered = poses_centered  @ blender2opencv
-    poses_centered = poses_centered[:, :3]  # (N_images, 3, 4)
+    # Keep the same convention adjustment as your original script.
+    R_c2w = -R_c2w
+    R_c2w[:, 0] = -R_c2w[:, 0]
 
-    return poses_centered, pose_avg_homo
-root_dir = sys.argv[1]
-colmap_dir = os.path.join(root_dir,"sparse_")
-if not os.path.exists(colmap_dir):
-    os.makedirs(colmap_dir)
-poses_arr = np.load(os.path.join(root_dir, "poses_bounds.npy"))
-poses = poses_arr[:, :-2].reshape([-1, 3, 5])  # (N_cams, 3, 5)
-near_fars = poses_arr[:, -2:]
-videos = glob.glob(os.path.join(root_dir, "cam[0-9][0-9]"))
-videos = sorted(videos)
-assert len(videos) == poses_arr.shape[0]
-H, W, focal = poses[0, :, -1]
-focal = focal/2
-focal = [focal, focal]
-poses = np.concatenate([poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1)
-videos = glob.glob(os.path.join(root_dir, "cam[0-9][0-9]"))
-videos = sorted(videos)
-image_paths = []
-for index, video_path in enumerate(videos):
-    image_path = os.path.join(video_path,"images","0000.png")
-    image_paths.append(image_path)
-print(image_paths)
-goal_dir = os.path.join(root_dir,"image_colmap")
-if not os.path.exists(goal_dir):
-    os.makedirs(goal_dir)
-import shutil
-image_name_list =[]
-for index, image in enumerate(image_paths):
-    image_name = image.split("/")[-1].split('.')
-    image_name[0] = "r_%03d" % index
-    print(image_name)
-    # breakpoint()
-    image_name = ".".join(image_name)
-    image_name_list.append(image_name)
-    goal_path = os.path.join(goal_dir,image_name)
-    shutil.copy(image,goal_path)
+    # COLMAP images.txt expects world-to-camera:
+    # x_cam = R * x_world + t
+    R_w2c = np.linalg.inv(R_c2w)
+    t_w2c = -R_w2c @ t_c2w
 
-print(poses)
-# write image information.
-object_images_file = open(os.path.join(colmap_dir,"images.txt"),"w")
-for idx, pose in enumerate(poses):
-    # pose_44 = np.eye(4)
+    qvec = rotmat2qvec(R_w2c)
+    return qvec, t_w2c
 
-    R = pose[:3,:3]
-    R = -R
-    R[:,0] = -R[:,0]
-    T = pose[:3,3]
-    
-    R = np.linalg.inv(R)
-    T = -np.matmul(R,T)
-    T = [str(i) for i in T]
-    qevc = [str(i) for i in rotmat2qvec(R)]
-    print(idx+1," ".join(qevc)," ".join(T),1,image_name_list[idx],"\n",file=object_images_file)
 
-# write camera infomation.
-object_cameras_file = open(os.path.join(colmap_dir,"cameras.txt"),"w")
-print(1,"SIMPLE_PINHOLE",1352,1014,focal[0],1352/2,1014/2,file=object_cameras_file) # 
-object_point_file = open(os.path.join(colmap_dir,"points3D.txt"),"w")
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python llff2colmap.py <root_dir>")
+        sys.exit(1)
 
-object_cameras_file.close()
-object_images_file.close()
-object_point_file.close()
+    root_dir = sys.argv[1]
+    poses_path = os.path.join(root_dir, "poses_bounds.npy")
+    if not os.path.isfile(poses_path):
+        raise FileNotFoundError(f"Missing poses file: {poses_path}")
+
+    sparse_dir = os.path.join(root_dir, "sparse_")
+    image_colmap_dir = os.path.join(root_dir, "image_colmap")
+
+    # Clean old outputs to avoid stale files.
+    if os.path.isdir(sparse_dir):
+        shutil.rmtree(sparse_dir)
+    if os.path.isdir(image_colmap_dir):
+        shutil.rmtree(image_colmap_dir)
+
+    ensure_dir(sparse_dir)
+    ensure_dir(image_colmap_dir)
+
+    poses_arr = np.load(poses_path)
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5])   # (N, 3, 5)
+    intrinsics = poses[:, :, -1]                    # (N, 3) = [H, W, focal]
+    poses = np.concatenate([poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], axis=-1)
+
+    cam_dirs = sorted(glob.glob(os.path.join(root_dir, "cam[0-9][0-9]")))
+    if len(cam_dirs) != poses.shape[0]:
+        raise ValueError(
+            f"Number of camXX folders ({len(cam_dirs)}) does not match "
+            f"number of poses ({poses.shape[0]})."
+        )
+
+    image_names = []
+    image_paths = []
+
+    for idx, cam_dir in enumerate(cam_dirs):
+        src_img = find_reference_image(cam_dir)
+        ext = os.path.splitext(src_img)[1].lower()
+        dst_name = f"r_{idx:03d}{ext}"
+        dst_path = os.path.join(image_colmap_dir, dst_name)
+
+        shutil.copy2(src_img, dst_path)
+        image_paths.append(src_img)
+        image_names.append(dst_name)
+
+    print("Copied reference images:")
+    for p in image_paths:
+        print(p)
+
+    cameras_txt = os.path.join(sparse_dir, "cameras.txt")
+    images_txt = os.path.join(sparse_dir, "images.txt")
+    points3D_txt = os.path.join(sparse_dir, "points3D.txt")
+
+    with open(cameras_txt, "w") as f_cam:
+        f_cam.write("# Camera list with one line of data per camera:\n")
+        f_cam.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f_cam.write(f"# Number of cameras: {len(poses)}\n")
+
+        for idx in range(len(poses)):
+            H, W, focal = intrinsics[idx]
+
+            H, W, focal = intrinsics[idx]
+            width = int(W)
+            height = int(H)
+            focal = float(focal)
+            cx = width / 2.0
+            cy = height / 2.0
+            k = 0.0
+
+            f_cam.write(
+                f"{idx + 1} SIMPLE_RADIAL {width} {height} {focal} {cx} {cy} {k}\n"
+            )
+
+    with open(images_txt, "w") as f_img:
+        f_img.write("# Image list with two lines of data per image:\n")
+        f_img.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f_img.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f_img.write(f"# Number of images: {len(poses)}\n")
+
+        for idx, pose in enumerate(poses):
+            qvec, tvec = llff_pose_to_colmap_extrinsic(pose)
+
+            image_id = idx + 1
+            camera_id = idx + 1
+            name = image_names[idx]
+
+            f_img.write(
+                f"{image_id} "
+                f"{qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} "
+                f"{tvec[0]} {tvec[1]} {tvec[2]} "
+                f"{camera_id} {name}\n"
+            )
+            f_img.write("\n")
+
+    with open(points3D_txt, "w") as f_pts:
+        f_pts.write("# 3D point list with one line of data per point:\n")
+        f_pts.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+        f_pts.write("# Number of points: 0\n")
+
+    print(f"\nWrote COLMAP text model to: {sparse_dir}")
+    print(f"Wrote copied images to: {image_colmap_dir}")
+
+
+if __name__ == "__main__":
+    main()
