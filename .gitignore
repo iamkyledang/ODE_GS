@@ -1,0 +1,35 @@
+# Python cache
+*.pyc
+*.pyo
+__pycache__/
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+#Data and output folder
+data/
+output/
+
+# Submodule build artifacts
+submodules/simple-knn/build/
+submodules/simple-knn/*.egg-info/
+submodules/depth-diff-gaussian-rasterization/build/
+submodules/depth-diff-gaussian-rasterization/*.egg-info/
+
+# Editor settings
+.vscode/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+tensorboard_3d/
+
+# Screenshots
+screenshots/
+
+
