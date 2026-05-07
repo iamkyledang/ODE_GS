@@ -6,17 +6,29 @@ Extends [4D Gaussian Splatting (Wu et al., CVPR 2024)](https://guanjunwu.github.
 
 ## Installation
 
+Please follow [4DGaussians](https://github.com/hustvl/4DGaussians) to install the relative packages.
+
+```bash
+git clone https://github.com/hustvl/4DGaussians
+cd 4DGaussians
+git submodule update --init --recursive
+conda create -n Gaussians4D python=3.7
+conda activate Gaussians4D
+pip install -r requirements.txt
+pip install -e submodules/depth-diff-gaussian-rasterization
+pip install -e submodules/simple-knn
+```
+
+Then clone this repo and install:
+
 ```bash
 git clone <this-repo> && cd 4DGaussians_ODE3
 git submodule update --init --recursive
 
-conda create -n Gaussians4D python=3.7
-conda activate Gaussians4D
-pip install -r requirements.txt
-
 export CUDA_HOME=/usr/local/cuda-11.7
 export CC=/usr/bin/gcc-11
 export CXX=/usr/bin/g++-11
+pip install -r requirements.txt
 pip install -e submodules/depth-diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 ```
