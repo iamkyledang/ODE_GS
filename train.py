@@ -14,15 +14,38 @@ import os, sys
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render_ode, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene
+from scene.gaussian_model import GaussianModel
 from utils.general_utils import safe_state
+
+
+def _get_gaussian_model_class(model_class: str):
+    """
+    Return the GaussianModel class for the requested model variant.
+
+    Values: ode (default), deformable_mlp, deformable_hexplane_mlp,
+            fourier_approx, polynomial_approx.
+    """
+    if model_class in (None, "", "ode"):
+        from scene.gaussian_model import GaussianModel as _GM
+    elif model_class == "deformable_mlp":
+        from baselines.deformable_MLP import GaussianModel as _GM
+    elif model_class == "deformable_hexplane_mlp":
+        from baselines.deformable_hexplane_MLP import GaussianModel as _GM
+    elif model_class == "fourier_approx":
+        from baselines.fourier_approx import GaussianModel as _GM
+    elif model_class == "polynomial_approx":
+        from baselines.polynomial_approx import GaussianModel as _GM
+    else:
+        raise ValueError(f"Unknown --model_class: {model_class!r}")
+    return _GM
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
+from arguments import ModelParams, PipelineParams, ODEModelParams, ODEOptimizationParams
 from torch.utils.data import DataLoader
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
@@ -38,9 +61,13 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
+def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer):
+                         gaussians, scene, stage, tb_writer, train_iter, timer,
+                         render_fn=None):
+    """One training stage (coarse or fine)."""
+    if render_fn is None:
+        render_fn = render_ode
     first_iter = 0
 
     gaussians.training_setup(opt)
@@ -119,11 +146,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         viewpoint_index = viewpoint_index
                     else:
                         viewpoint_index = len(video_cams) - viewpoint_index - 1
-                    # print(viewpoint_index)
                     viewpoint = video_cams[viewpoint_index]
                     custom_cam.time = viewpoint.time
-                    # print(custom_cam.time, viewpoint_index, count)
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
+                    net_image = render_fn(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
 
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
@@ -178,7 +203,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
+            render_pkg = render_fn(viewpoint_cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
             if scene.dataset_type!="PanopticSports":
@@ -205,10 +230,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         
 
         loss = Ll1
-        if stage == "fine" and hyper.time_smoothness_weight != 0:
-            # tv_loss = 0
-            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-            loss += tv_loss
+        if stage == "fine":
+            if hyper.lambda_ode != 0:
+                loss += hyper.lambda_ode * gaussians.compute_ode_regulation()
         if opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
@@ -240,7 +264,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Log and save
             timer.pause()
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_fn, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -249,8 +273,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     or (iteration < 3000 and iteration % 50 == 49) \
                         or (iteration < 60000 and iteration %  100 == 99) :
                     # breakpoint()
-                        render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                        render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                        render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render_fn, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                        render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render_fn, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
                         # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
 
                     # total_images.append(to8b(temp_image).transpose(1,2,0))
@@ -282,9 +306,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
                     print("reset opacity")
-                    gaussians.reset_opacity()
-                    
-            
+                    gaussians.reset_opacity()                               
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -294,20 +316,26 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
-    # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
-    gaussians = GaussianModel(dataset.sh_degree, hyper)
+
+    GaussianModelClass = _get_gaussian_model_class(getattr(args, "model_class", None))
+    gaussians = GaussianModelClass(dataset.sh_degree, hyper)
+    render_fn = render_ode
+
     dataset.model_path = args.model_path
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
-                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer)
+                             gaussians, scene, "coarse", tb_writer, opt.coarse_iterations, timer,
+                             render_fn=render_fn)
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+                         gaussians, scene, "fine", tb_writer, opt.iterations, timer,
+                         render_fn=render_fn)
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -377,10 +405,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         if tb_writer:
             tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            
             tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration,max_bins=500)
         
         torch.cuda.empty_cache()
 def setup_seed(seed):
@@ -390,43 +415,45 @@ def setup_seed(seed):
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
 if __name__ == "__main__":
-    # Set up command line argument parser
-    # torch.set_default_tensor_type('torch.FloatTensor')
     torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
     lp = ModelParams(parser)
-    op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    hp = ModelHiddenParams(parser)
+    op = ODEOptimizationParams(parser)
+    hp = ODEModelParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000,14000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 14000, 20000, 30_000, 45000, 60000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[14000, 20000, 30_000, 45000, 60000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--expname", type=str, default = "")
-    parser.add_argument("--configs", type=str, default = "")
-    
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--expname", type=str, default="")
+    parser.add_argument("--configs", type=str, default="")
+    parser.add_argument("--model_class", type=str, default="ode",
+                        help="Gaussian model class to use: ode (default), "
+                             "deformable_mlp, deformable_hexplane_mlp, "
+                             "fourier_approx, polynomial_approx.")
+
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
     if args.configs:
         import mmcv
         from utils.params_utils import merge_hparams
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
+    args.save_iterations.append(args.iterations)
+
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
-
-    # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname)
+    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+             args.start_checkpoint, args.debug_from, args.expname)
 
     # All done
     print("\nTraining complete.")
