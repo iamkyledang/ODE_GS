@@ -65,7 +65,6 @@ METHOD_CONFIGS = {
             "--densify_until_iter 15000 "
             "--lambda_ode 0.001 "
             "--lambda_dssim 0.2 "
-            "--net_width 64 "          # ODE hidden-network width
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
             + _BASE_FLAGS
