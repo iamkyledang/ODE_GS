@@ -6,11 +6,11 @@ Extends [4D Gaussian Splatting (Wu et al., CVPR 2024)](https://guanjunwu.github.
 
 ## Installation
 
-Please follow [4DGaussians](https://github.com/hustvl/4DGaussians) to install the relative packages.
+Please follow the instruction bellow for installation
 
 ```bash
-git clone https://github.com/hustvl/4DGaussians
-cd 4DGaussians
+git clone https://github.com/iamkyledang/ODE_GS
+cd ODE_GS
 git submodule update --init --recursive
 conda create -n Gaussians4D python=3.7
 conda activate Gaussians4D
