@@ -185,8 +185,8 @@ class GaussianModel:
         D       = getattr(args, "deform_mlp_depth", self._MLP_DEPTH)
 
         # Positional / time encoding buffers
-        pos_freqs  = torch.FloatTensor([2 ** i for i in range(pos_pe)])
-        time_freqs = torch.FloatTensor([2 ** i for i in range(time_pe)])
+        pos_freqs  = torch.from_numpy(np.array([2 ** i for i in range(pos_pe)], dtype=np.float32))
+        time_freqs = torch.from_numpy(np.array([2 ** i for i in range(time_pe)], dtype=np.float32))
 
         pos_ch = 3 + 2 * 3 * pos_pe
         t_ch   = 1 + 2 * 1 * time_pe
@@ -234,8 +234,8 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, time_line: int):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color       = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points).astype(np.float32)).cuda()
+        fused_color       = RGB2SH(torch.from_numpy(np.asarray(pcd.colors).astype(np.float32)).cuda())
         N = fused_point_cloud.shape[0]
 
         features = torch.zeros((N, 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -573,12 +573,12 @@ class GaussianModel:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        self._xyz           = nn.Parameter(torch.tensor(xyz,           dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc   = nn.Parameter(torch.tensor(features_dc,  dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity       = nn.Parameter(torch.tensor(opacities,     dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling       = nn.Parameter(torch.tensor(scales,        dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation      = nn.Parameter(torch.tensor(rots,          dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz           = nn.Parameter(torch.from_numpy(xyz.astype(np.float32)).cuda().requires_grad_(True))
+        self._features_dc   = nn.Parameter(torch.from_numpy(features_dc.astype(np.float32)).cuda().transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.from_numpy(features_extra.astype(np.float32)).cuda().transpose(1, 2).contiguous().requires_grad_(True))
+        self._opacity       = nn.Parameter(torch.from_numpy(opacities.astype(np.float32)).cuda().requires_grad_(True))
+        self._scaling       = nn.Parameter(torch.from_numpy(scales.astype(np.float32)).cuda().requires_grad_(True))
+        self._rotation      = nn.Parameter(torch.from_numpy(rots.astype(np.float32)).cuda().requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
 
     def save_deformation(self, path):

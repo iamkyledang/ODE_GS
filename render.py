@@ -50,6 +50,19 @@ from time import time
 import threading
 import concurrent.futures
 
+
+# ---------------------------------------------------------------------------
+# GPU capability detection
+# ---------------------------------------------------------------------------
+
+def _is_high_memory_gpu() -> bool:
+    """Return True when a high-VRAM GPU (RTX 4090, 24 GB) is detected."""
+    if not torch.cuda.is_available():
+        return False
+    return "4090" in torch.cuda.get_device_name(0).lower()
+
+_HIGH_MEM: bool = _is_high_memory_gpu()
+
 def lerp(a, b, alpha):
     return (1.0 - alpha) * a + alpha * b
 
@@ -219,8 +232,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             del gt_cpu
 
         del rendering, render_cpu
-        torch.cuda.empty_cache()
+        if not _HIGH_MEM:
+            torch.cuda.empty_cache()
 
+    if _HIGH_MEM:
+        torch.cuda.empty_cache()  # flush once after the full render loop
     time2 = time()
     print("FPS:", (len(views) - 1) / (time2 - time1))
 

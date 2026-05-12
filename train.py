@@ -56,6 +56,20 @@ import copy
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
+
+# ---------------------------------------------------------------------------
+# GPU capability detection
+# ---------------------------------------------------------------------------
+
+def _is_high_memory_gpu() -> bool:
+    """Return True when a high-VRAM GPU (RTX 4090, 24 GB) is detected."""
+    if not torch.cuda.is_available():
+        return False
+    return "4090" in torch.cuda.get_device_name(0).lower()
+
+_HIGH_MEM: bool = _is_high_memory_gpu()
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -369,7 +383,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     
     # Report test and samples of training set
     if iteration in testing_iterations:
-        torch.cuda.empty_cache()
+        if not _HIGH_MEM:
+            torch.cuda.empty_cache()
         # 
         validation_configs = ({'name': 'test', 'cameras' : [scene.getTestCameras()[idx % len(scene.getTestCameras())] for idx in range(10, 5000, 299)]},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(10, 5000, 299)]})
@@ -407,7 +422,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
         
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # always flush after validation
 def setup_seed(seed):
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
