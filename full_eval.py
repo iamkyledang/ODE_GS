@@ -24,6 +24,7 @@
 #
 
 import os
+import re
 import json
 import numpy as np
 from argparse import ArgumentParser
@@ -167,6 +168,62 @@ METHOD_CONFIGS = {
 
 ALL_METHODS = list(METHOD_CONFIGS.keys())
 METRICS     = ["PSNR", "SSIM", "LPIPS-vgg", "LPIPS-alex", "MS-SSIM", "D-SSIM"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resume helpers — detect whether a phase has already completed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_final_iteration(train_args: str) -> int:
+    """Return the --iterations value from a train_args string, or 0 if absent."""
+    m = re.search(r"--iterations\s+(\d+)", train_args)
+    return int(m.group(1)) if m else 0
+
+
+def is_training_done(method: str, scene: str, output_root: str) -> bool:
+    """
+    Training is complete when the final-iteration point_cloud.ply exists.
+    Falls back to any checkpoint if the target iteration cannot be parsed.
+    """
+    out_dir    = Path(output_root) / method / scene
+    cfg        = METHOD_CONFIGS[method]
+    final_iter = _parse_final_iteration(cfg["train_args"])
+    if final_iter > 0:
+        ply = out_dir / "point_cloud" / f"iteration_{final_iter}" / "point_cloud.ply"
+        return ply.exists()
+    # Fallback: any iteration checkpoint present
+    pc_dir = out_dir / "point_cloud"
+    if not pc_dir.is_dir():
+        return False
+    return any(pc_dir.rglob("point_cloud.ply"))
+
+
+def is_rendering_done(method: str, scene: str, output_root: str) -> bool:
+    """
+    Rendering is complete when test/ contains at least one ours_* subfolder
+    that holds rendered PNG images.
+    """
+    test_dir = Path(output_root) / method / scene / "test"
+    if not test_dir.is_dir():
+        return False
+    for ours_dir in test_dir.iterdir():
+        if ours_dir.is_dir() and ours_dir.name.startswith("ours_"):
+            if any(ours_dir.rglob("*.png")):
+                return True
+    return False
+
+
+def is_metrics_done(method: str, scene: str, output_root: str) -> bool:
+    """Metrics are done when a non-empty results.json exists."""
+    results = Path(output_root) / method / scene / "results.json"
+    if not results.exists():
+        return False
+    try:
+        with open(results) as f:
+            data = json.load(f)
+        return bool(data)
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -446,19 +503,28 @@ if __name__ == "__main__":
     if not args.skip_training:
         for method in args.methods:
             for scene in args.scenes:
-                train_method(method, scene, args.data_root, args.output_root)
+                if is_training_done(method, scene, args.output_root):
+                    print(f"\n[train] SKIP {method}/{scene}  (final checkpoint already exists)")
+                else:
+                    train_method(method, scene, args.data_root, args.output_root)
 
     # ── Rendering ─────────────────────────────────────────────────────────
     if not args.skip_rendering:
         for method in args.methods:
             for scene in args.scenes:
-                render_method(method, scene, args.output_root, args.render_iteration)
+                if is_rendering_done(method, scene, args.output_root):
+                    print(f"\n[render] SKIP {method}/{scene}  (rendered images already exist)")
+                else:
+                    render_method(method, scene, args.output_root, args.render_iteration)
 
     # ── Metrics ───────────────────────────────────────────────────────────
     if not args.skip_metrics:
         for method in args.methods:
             for scene in args.scenes:
-                run_metrics(method, scene, args.output_root, eval_flow=args.eval_flow)
+                if is_metrics_done(method, scene, args.output_root):
+                    print(f"\n[metrics] SKIP {method}/{scene}  (results.json already exists)")
+                else:
+                    run_metrics(method, scene, args.output_root, eval_flow=args.eval_flow)
 
     # ── Merge + save result.json ──────────────────────────────────────────
     merged = merge_results(args.methods, args.scenes, args.output_root)
