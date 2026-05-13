@@ -155,7 +155,7 @@ class HexPlaneField(nn.Module):
         return self.aabb[0], self.aabb[1]
 
     def set_aabb(self, xyz_max, xyz_min):
-        aabb = torch.tensor(np.array([xyz_max, xyz_min]), dtype=torch.float32)
+        aabb = torch.tensor(np.array([xyz_max, xyz_min]), dtype=torch.float32).cuda()
         self.aabb = nn.Parameter(aabb, requires_grad=False)
         print("HexPlaneField: set aabb =", self.aabb)
 
