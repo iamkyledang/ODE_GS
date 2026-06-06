@@ -49,6 +49,28 @@ from utils.system_utils import mkdir_p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TV / smoothness helpers (adapted from hustvl/4DGaussians/scene/regulation.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_plane_tv(t: torch.Tensor) -> torch.Tensor:
+    """Total variation loss for a 2-D plane grid of shape (1, C, H, W)."""
+    batch_size, c, h, w = t.shape
+    count_h = batch_size * c * (h - 1) * w
+    count_w = batch_size * c * h * (w - 1)
+    h_tv = torch.square(t[..., 1:, :] - t[..., :h - 1, :]).sum()
+    w_tv = torch.square(t[..., :, 1:] - t[..., :, :w - 1]).sum()
+    return 2.0 * (h_tv / count_h + w_tv / count_w)
+
+
+def _compute_plane_smoothness(t: torch.Tensor) -> torch.Tensor:
+    """2nd-order temporal smoothness loss (second difference along dim -2)."""
+    batch_size, c, h, w = t.shape
+    first_diff  = t[..., 1:, :] - t[..., :h - 1, :]           # (B, C, h-1, W)
+    second_diff = first_diff[..., 1:, :] - first_diff[..., :h - 2, :]  # (B, C, h-2, W)
+    return torch.square(second_diff).mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HexPlane field implementation (adapted from hustvl/4DGaussians)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -388,8 +410,47 @@ class GaussianModel:
         return self._xyz + d_xyz, self._scaling + d_scale, self._rotation + d_rot
 
     def compute_ode_regulation(self) -> torch.Tensor:
-        """No ODE regularisation for this baseline."""
-        return torch.tensor(0.0, device="cuda", requires_grad=True)
+        """
+        Spatial/temporal TV regularisation following hustvl/4DGaussians.
+
+        Weights are read from args stored in __init__:
+          plane_tv_weight        : TV loss on spatial planes (xy, xz, yz)
+          time_smoothness_weight : 2nd-order smoothness on temporal planes (xt, yt, zt)
+          l1_time_planes         : L1 penalty on temporal planes (encourages init values)
+
+        Grid index mapping for 6 planes from itertools.combinations(range(4), 2):
+          0=(0,1)=xy  1=(0,2)=xz  2=(0,3)=xt  3=(1,2)=yz  4=(1,3)=yt  5=(2,3)=zt
+        """
+        plane_tv_w = getattr(self._args, "plane_tv_weight",        0.0)
+        time_sm_w  = getattr(self._args, "time_smoothness_weight",  0.0)
+        l1_time_w  = getattr(self._args, "l1_time_planes",          0.0)
+
+        if plane_tv_w == 0.0 and time_sm_w == 0.0 and l1_time_w == 0.0:
+            return torch.tensor(0.0, device="cuda", requires_grad=True)
+
+        # Spatial planes: (xy)=0, (xz)=1, (yz)=3
+        # Temporal planes: (xt)=2, (yt)=4, (zt)=5
+        spatial_ids  = [0, 1, 3]
+        temporal_ids = [2, 4, 5]
+
+        total = torch.tensor(0.0, device="cuda")
+
+        for scale_grids in self._hexplane.grids:
+            n_planes = len(scale_grids)
+            for gid in spatial_ids:
+                if gid < n_planes and plane_tv_w != 0.0:
+                    g = scale_grids[gid]   # (1, C, H, W)
+                    total = total + plane_tv_w * _compute_plane_tv(g)
+            for gid in temporal_ids:
+                if gid < n_planes:
+                    g = scale_grids[gid]
+                    if time_sm_w != 0.0:
+                        total = total + time_sm_w * _compute_plane_smoothness(g)
+                    if l1_time_w != 0.0:
+                        # temporal planes are initialised to 1.0; penalise deviation
+                        total = total + l1_time_w * torch.abs(1.0 - g).mean()
+
+        return total
 
     # ---------------------------------------------------------------- training setup
 

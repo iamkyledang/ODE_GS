@@ -38,6 +38,8 @@ def _get_gaussian_model_class(model_class: str):
         from baselines.fourier_approx import GaussianModel as _GM
     elif model_class == "polynomial_approx":
         from baselines.polynomial_approx import GaussianModel as _GM
+    elif model_class == "neural_ode":
+        from baselines.neural_ode import GaussianModel as _GM
     else:
         raise ValueError(f"Unknown --model_class: {model_class!r}")
     return _GM
@@ -68,6 +70,18 @@ def _is_high_memory_gpu() -> bool:
     return "4090" in torch.cuda.get_device_name(0).lower()
 
 _HIGH_MEM: bool = _is_high_memory_gpu()
+
+# ── Hardware-specific CUDA tuning ────────────────────────────────────────────────────────
+# cudnn.benchmark: cuDNN benchmarks conv algorithms per observed input shape and
+# caches the fastest one.  Compatible with deterministic=True (set in setup_seed)
+# — cuDNN selects the fastest *deterministic* algorithm for each shape.
+torch.backends.cudnn.benchmark = True
+
+if _HIGH_MEM:
+    # TF32 matmul: ≈2–3× faster on Ada Lovelace (RTX 4090) vs FP32, with only
+    # ~0.1% mean relative error — safe for 3DGS-style reconstruction tasks.
+    # Disabled by default in PyTorch for backward-compat; set explicitly here.
+    torch.set_float32_matmul_precision("high")
 
 
 try:
@@ -127,10 +141,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         viewpoint_stack = scene.getTrainCameras()
         if opt.custom_sampler is not None:
             sampler = FineSampler(viewpoint_stack)
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list,pin_memory=_HIGH_MEM)
             random_loader = False
         else:
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list,pin_memory=_HIGH_MEM)
             random_loader = True
         loader = iter(viewpoint_stack_loader)
     
@@ -433,6 +447,12 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
+    # ── Hardware info ────────────────────────────────────────────────────────
+    _gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    if _HIGH_MEM:
+        print(f"[hardware] {_gpu} — TF32 matmul + cudnn.benchmark + pin_memory ON")
+    else:
+        print(f"[hardware] {_gpu} — cudnn.benchmark ON  (standard precision, pin_memory OFF)")
     lp = ModelParams(parser)
     pp = PipelineParams(parser)
     op = ODEOptimizationParams(parser)

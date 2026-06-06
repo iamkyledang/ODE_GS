@@ -75,7 +75,9 @@ class GaussianModel:
     """
 
     # Polynomial degree: terms tau^1 through tau^D
-    D = 4
+    # Reference: Gaussian-Flow (NJU-3DV) uses pos_traj_dim=3 (3rd-degree polynomial)
+    # Reference: Gaussian-Flow (NJU-3DV) uses pos_traj_dim=3 (3rd-degree polynomial)
+    D = 3
 
     # ------------------------------------------------------------------ setup
 

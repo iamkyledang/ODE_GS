@@ -1,24 +1,41 @@
 #
 # full_eval.py  —  Baseline comparison for ODE-based dynamic 4D Gaussian Splatting.
 #
-# Trains five temporal-deformation models on coffee_martini (MultipleView dataset)
+# Trains six temporal-deformation models on coffee_martini (MultipleView dataset)
 # and evaluates them with the full metrics suite.  All method configs are declared
 # inline below — no external config files are needed.
 #
 # Methods compared:
-#   1. ode                    — proposed: 3D ODE deformation (this repo)
-#   2. deformable_mlp         — per-Gaussian deformation MLP (ingra14m/Deformable-3D-Gaussians)
+#   1. ode                     — proposed: 3D ODE deformation (this repo)
+#   2. deformable_mlp          — per-Gaussian deformation MLP (ingra14m/Deformable-3D-Gaussians)
 #   3. deformable_hexplane_mlp — HexPlane + MLP (hustvl/4DGaussians)
-#   4. fourier_approx         — per-Gaussian Fourier series approximation
-#   5. polynomial_approx      — per-Gaussian polynomial approximation
+#   4. fourier_approx          — per-Gaussian Fourier series (raven38/EfficientDynamic3DGaussian)
+#   5. polynomial_approx       — per-Gaussian polynomial (NJU-3DV/Gaussian-Flow)
+#   6. neural_ode              — shared velocity MLP + Euler ODE (arnold-caleb/evogs)
 #
-# Usage:
-#   python full_eval.py                            # train + render + metrics for all methods
-#   python full_eval.py --skip_training            # skip training (use existing checkpoints)
-#   python full_eval.py --skip_rendering           # skip rendering
-#   python full_eval.py --skip_metrics             # skip metrics computation
-#   python full_eval.py --methods ode fourier_approx  # run a subset of methods
-#   python full_eval.py --data_root /path/to/data  # custom data location
+# Usage — full comparison:
+#   python full_eval.py                              # train + render + metrics, all methods
+#   python full_eval.py --skip_training              # skip training (use existing checkpoints)
+#   python full_eval.py --skip_rendering             # skip rendering
+#   python full_eval.py --skip_metrics               # skip metrics computation
+#   python full_eval.py --data_root /path/to/data    # custom data root
+#
+# Usage — single-method runs (train → render → metrics for ONE baseline):
+#   python full_eval.py --method ode
+#   python full_eval.py --method deformable_mlp
+#   python full_eval.py --method deformable_hexplane_mlp
+#   python full_eval.py --method fourier_approx
+#   python full_eval.py --method polynomial_approx
+#   python full_eval.py --method neural_ode
+#   python full_eval.py --method ode --skip_training   # render + metrics only
+#
+# Usage — explicit subset:
+#   python full_eval.py --methods ode fourier_approx polynomial_approx
+#
+# Hardware:
+#   RTX 4090 (24 GB) is detected automatically.  batch_size and memory optimisations
+#   scale up on the 4090; the script falls back to conservative settings on any
+#   other GPU (e.g. RTX 3060 6 GB).
 #
 # All outputs are written under output/output_baselines/ (relative to cwd).
 #
@@ -26,9 +43,28 @@
 import os
 import re
 import json
+import shutil
 import numpy as np
+import torch
 from argparse import ArgumentParser
 from pathlib import Path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware detection — runs once at startup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_high_mem_gpu() -> bool:
+    """Return True when an RTX 4090 (24 GB VRAM) is present."""
+    if not torch.cuda.is_available():
+        return False
+    return "4090" in torch.cuda.get_device_name(0).lower()
+
+
+_IS_HIGH_MEM: bool = _detect_high_mem_gpu()
+_GPU_NAME:    str  = (
+    torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU (no CUDA)"
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,10 +81,16 @@ DEFAULT_OUTPUT   = "output/output_baselines"
 # config files are used (no --configs flag).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Shared base flags for MultipleView / coffee_martini
+# Shared base flags for MultipleView / coffee_martini.
+# batch_size scales with detected VRAM:
+#   RTX 4090 (24 GB) → batch_size=2: renders 2 cameras per gradient step,
+#     doubling data throughput without exceeding VRAM (Gaussians are shared).
+#   RTX 3060 (6 GB) / other → batch_size=1: conservative safe default.
+_BATCH_SIZE: int = 2 if _IS_HIGH_MEM else 1
+
 _BASE_FLAGS = (
     "--dataloader "
-    "--batch_size 1 "
+    f"--batch_size {_BATCH_SIZE} "
     "--opacity_threshold_coarse 0.005 "
     "--opacity_threshold_fine_init 0.005 "
     "--opacity_threshold_fine_after 0.005 "
@@ -57,35 +99,59 @@ _BASE_FLAGS = (
 
 METHOD_CONFIGS = {
     # ── Proposed: ODE deformation ──────────────────────────────────────────
+    # Per-Gaussian closed-form ODE (A, b, x0, kappa, omega) — no neural net.
+    # Key optimizations vs vanilla defaults:
+    #   - 30k iterations: matches other baselines for a fair comparison.
+    #     The closed-form ODE converges faster than MLP-based methods.
+    #   - ode_lr_init=0.001: effective LR ≈ ode_lr_init × spatial_lr_scale (~5).
+    #     The 21 per-Gaussian ODE params start at zero; a higher LR lets them
+    #     learn non-trivial dynamics within the training budget.
+    #   - ode_lr_final=0.0001: ~10× decay ratio, keeps refinement stable.
+    #   - position_lr_max_steps=20000: LR decays to minimum at 2/3 of training,
+    #     leaving the final 10k iterations for fine-grained ODE refinement.
+    #   - scaling_lr=0.001: canonical scale changes slowly because temporal
+    #     covariance variation is already captured by kappa/omega_cov ODE params.
+    #   - lambda_ode=0.001: regularises trajectory velocity (L_traj), covariance
+    #     rotation speed (L_omega), and scale rate (L_s) from framework.tex §7.3.
     "ode": dict(
         model_class="ode",
         train_args=(
             "--model_class ode "
-            "--iterations 100000 "
+            "--iterations 30000 "
             "--coarse_iterations 3000 "
             "--densify_until_iter 15000 "
+            "--position_lr_max_steps 20000 "
+            "--ode_lr_init 0.001 "
+            "--ode_lr_final 0.0001 "
+            "--scaling_lr 0.001 "
             "--lambda_ode 0.001 "
             "--lambda_dssim 0.2 "
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
+            "--time_smoothness_weight 0.0 "
+            "--l1_time_planes 0.0 "
             + _BASE_FLAGS
         ),
     ),
 
     # ── Deformable 3D Gaussians (MLP) ────────────────────────────────────
     # Based on: ingra14m/Deformable-3D-Gaussians (CVPR 2024)
-    # Arch params (all editable here):
-    #   deform_mlp_width  : hidden layer width        (default 256)
-    #   deform_mlp_depth  : number of hidden layers   (default 8)
-    #   deform_pos_pe     : pos encoding frequencies  (default 10 → pos_ch=63)
-    #   deform_time_pe    : time encoding frequencies (default 4  → t_ch=9)
+    # Reference configs from arguments/__init__.py OptimizationParams:
+    #   iterations=40000, warm_up=3000, scaling_lr=0.001,
+    #   densify_grad_threshold=0.0007, position_lr_max_steps=30000
+    # Arch params:
+    #   deform_mlp_width=256, deform_mlp_depth=8, deform_pos_pe=10, deform_time_pe=4
     "deformable_mlp": dict(
         model_class="deformable_mlp",
         train_args=(
             "--model_class deformable_mlp "
-            "--iterations 100000 "
+            "--iterations 40000 "
             "--coarse_iterations 3000 "
             "--densify_until_iter 15000 "
+            "--position_lr_max_steps 30000 "
+            "--scaling_lr 0.001 "
+            "--densify_grad_threshold_fine_init 0.0007 "
+            "--densify_grad_threshold_after 0.0007 "
             "--lambda_ode 0.0 "
             "--lambda_dssim 0.2 "
             "--bounds 1.6 "
@@ -100,67 +166,95 @@ METHOD_CONFIGS = {
 
     # ── 4D Gaussians (HexPlane + MLP) ────────────────────────────────────
     # Based on: hustvl/4DGaussians (CVPR 2024)
-    # Arch params (all editable here):
-    #   hexplane_spatial_res : spatial grid resolution x/y/z  (default 64)
-    #   hexplane_time_res    : temporal grid resolution t      (default 150)
-    #   hexplane_feat_dim    : output feature dim per plane    (default 16)
-    #   hexplane_decode_W    : decoder MLP hidden width        (default 128)
-    #   hexplane_decode_D    : decoder MLP hidden layers       (default 1)
+    # Reference configs from arguments/multipleview/default.py:
+    #   iterations=15000, coarse=3000, densify_until=10000,
+    #   net_width=128, defor_depth=0, multires=[1,2], kplanes=[64,64,64,150],
+    #   plane_tv=0.0002, time_smooth=0.001, l1_time=0.0001, feat_dim=16
+    # TV/smoothness losses enabled via lambda_ode=1.0 + compute_ode_regulation()
     "deformable_hexplane_mlp": dict(
         model_class="deformable_hexplane_mlp",
         train_args=(
             "--model_class deformable_hexplane_mlp "
-            "--iterations 100000 "
+            "--iterations 15000 "
             "--coarse_iterations 3000 "
             "--densify_until_iter 10000 "
-            "--lambda_ode 0.0 "
+            "--lambda_ode 1.0 "
+            "--plane_tv_weight 0.0002 "
+            "--time_smoothness_weight 0.001 "
+            "--l1_time_planes 0.0001 "
             "--lambda_dssim 0.2 "
             "--bounds 1.6 "
-            "--plane_tv_weight 0.0002 "
             "--hexplane_spatial_res 64 "
             "--hexplane_time_res 150 "
             "--hexplane_feat_dim 16 "
             "--hexplane_decode_W 128 "
-            "--hexplane_decode_D 1 "
+            "--hexplane_decode_D 0 "
             + _BASE_FLAGS
         ),
     ),
 
     # ── Fourier approximation ────────────────────────────────────────────
     # Based on: raven38/EfficientDynamic3DGaussian
-    # Arch param (editable here):
-    #   fourier_K : number of sin/cos frequency components (default 4)
+    # Reference configs from arguments/__init__.py OptimizationParams:
+    #   iterations=30000, lambda_lasso=0 (L1 reg via lambda_ode), approx_l=2 → fourier_K=2
     "fourier_approx": dict(
         model_class="fourier_approx",
         train_args=(
             "--model_class fourier_approx "
-            "--iterations 100000 "
+            "--iterations 30000 "
             "--coarse_iterations 3000 "
             "--densify_until_iter 15000 "
             "--lambda_ode 0.0 "
             "--lambda_dssim 0.2 "
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
-            "--fourier_K 4 "
+            "--fourier_K 2 "
             + _BASE_FLAGS
         ),
     ),
 
     # ── Polynomial approximation ─────────────────────────────────────────
-    # Arch param (editable here):
-    #   poly_D : polynomial degree (fits tau^1 … tau^D, no constant term) (default 4)
+    # Based on: NJU-3DV/Gaussian-Flow (poly_fourier with traj_dim=3 → degree 3)
+    # Reference configs from configs/dnerf.yaml:
+    #   max_steps=30000, densify_grad_threshold=0.0002
     "polynomial_approx": dict(
         model_class="polynomial_approx",
         train_args=(
             "--model_class polynomial_approx "
-            "--iterations 100000 "
+            "--iterations 30000 "
             "--coarse_iterations 3000 "
             "--densify_until_iter 15000 "
             "--lambda_ode 0.0 "
             "--lambda_dssim 0.2 "
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
-            "--poly_D 4 "
+            "--poly_D 3 "
+            + _BASE_FLAGS
+        ),
+    ),
+
+    # ── Neural ODE velocity field ─────────────────────────────────────────
+    # Based on: arnold-caleb/evogs (EvoGS)
+    # Reference configs from arguments/dynerf/base.py + base_velocity.py:
+    #   iterations=14000 (dynerf/base), coarse=3000, densify_until=10000,
+    #   net_width=128, velocity field enabled, Euler integration with 4 steps
+    # Velocity reg via lambda_ode=0.001 + compute_ode_regulation()
+    "neural_ode": dict(
+        model_class="neural_ode",
+        train_args=(
+            "--model_class neural_ode "
+            "--iterations 14000 "
+            "--coarse_iterations 3000 "
+            "--densify_until_iter 10000 "
+            "--lambda_ode 0.001 "
+            "--lambda_dssim 0.2 "
+            "--bounds 1.6 "
+            "--plane_tv_weight 0.0 "
+            "--neural_ode_width 128 "
+            "--neural_ode_depth 1 "
+            "--neural_ode_pos_pe 10 "
+            "--neural_ode_time_pe 4 "
+            "--neural_ode_steps 4 "
             + _BASE_FLAGS
         ),
     ),
@@ -168,7 +262,6 @@ METHOD_CONFIGS = {
 
 ALL_METHODS = list(METHOD_CONFIGS.keys())
 METRICS     = ["PSNR", "SSIM", "LPIPS-vgg", "LPIPS-alex", "MS-SSIM", "D-SSIM"]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Resume helpers — detect whether a phase has already completed
@@ -224,6 +317,16 @@ def is_metrics_done(method: str, scene: str, output_root: str) -> bool:
         return bool(data)
     except (json.JSONDecodeError, OSError):
         return False
+
+
+def is_samples_done(method: str, scene: str, output_root: str) -> bool:
+    """
+    Sample extraction is complete when sample/ contains at least pose_1.png.
+    A sentinel file sample/.done (written by sample_method) is used as the
+    authoritative marker so a partial extraction is never mistaken for complete.
+    """
+    sample_dir = Path(output_root) / method / scene / "sample"
+    return (sample_dir / ".done").exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +391,67 @@ def run_metrics(method: str, scene: str, output_root: str, eval_flow: bool = Fal
     print(f"\n[metrics] {method}/{scene}")
     print(f"  {cmd}")
     os.system(cmd)
+
+
+def sample_method(method: str, scene: str, output_root: str):
+    """
+    Extract the first rendered frame per camera pose into <output_root>/<method>/<scene>/sample/.
+
+    Reads cameras_metadata.json from the most recent test/ours_N/renders/ directory
+    and copies pose_1.png … pose_N.png.  Writes a .done sentinel on success so
+    full_eval.py can resume correctly after an interruption.
+    """
+    test_dir = Path(output_root) / method / scene / "test"
+    if not test_dir.is_dir():
+        print(f"  [WARNING] {method}/{scene}: no test/ dir — run rendering first.")
+        return
+
+    # Find the latest ours_N directory
+    ours_dirs = sorted(
+        [d for d in test_dir.iterdir() if d.is_dir() and d.name.startswith("ours_")],
+        key=lambda d: int(d.name.split("_")[-1]) if d.name.split("_")[-1].isdigit() else 0,
+    )
+    if not ours_dirs:
+        print(f"  [WARNING] {method}/{scene}: no ours_* dir found in test/ — skipping samples.")
+        return
+
+    renders_dir = ours_dirs[-1] / "renders"
+    meta_path   = renders_dir / "cameras_metadata.json"
+    if not meta_path.exists():
+        print(f"  [WARNING] {method}/{scene}: cameras_metadata.json missing — skipping samples.")
+        return
+
+    with open(meta_path) as f:
+        cam_meta = json.load(f)  # {"00000.png": "cam_name", ...}
+
+    # Group filenames by camera, sort within each camera
+    cam_frames: dict = {}
+    for fname, cam_name in cam_meta.items():
+        cam_frames.setdefault(cam_name, []).append(fname)
+
+    if not cam_frames:
+        print(f"  [WARNING] {method}/{scene}: cameras_metadata.json is empty.")
+        return
+
+    sample_dir = Path(output_root) / method / scene / "sample"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    sorted_cams = sorted(cam_frames.keys())
+    count = 0
+    for pose_idx, cam_name in enumerate(sorted_cams, start=1):
+        first_frame = sorted(cam_frames[cam_name])[0]  # earliest timestep
+        src = renders_dir / first_frame
+        dst = sample_dir / f"pose_{pose_idx}.png"
+        if src.exists():
+            shutil.copy2(str(src), str(dst))
+            count += 1
+
+    if count > 0:
+        # Write sentinel so is_samples_done() is unambiguous
+        (sample_dir / ".done").write_text(f"{count} poses\n")
+        print(f"\n[sample] {method}/{scene}  →  {count} pose images in {sample_dir}")
+    else:
+        print(f"  [WARNING] {method}/{scene}: no pose images could be copied.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,16 +644,34 @@ def save_comparison_table_image(methods: list, scenes: list, merged: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Baseline comparison for ODE 4D Gaussian Splatting")
+    parser = ArgumentParser(
+        description="Baseline comparison for ODE 4D Gaussian Splatting.",
+        epilog=(
+            "Single-method examples:\n"
+            "  python full_eval.py --method ode\n"
+            "  python full_eval.py --method fourier_approx --skip_training\n"
+            "  python full_eval.py --method neural_ode --skip_training --skip_rendering\n"
+            "\nFull comparison:\n"
+            "  python full_eval.py                    # all methods\n"
+            "  python full_eval.py --skip_training    # render + metrics only"
+        ),
+    )
     parser.add_argument("--data_root",        type=str, default=DEFAULT_DATA_ROOT,
                         help="Root containing scene sub-folders (default: data/multipleview).")
     parser.add_argument("--output_root",      type=str, default=DEFAULT_OUTPUT,
                         help="Root output directory (default: output/output_baselines).")
     parser.add_argument("--scenes",           nargs="+", type=str, default=[DEFAULT_SCENE],
                         help="Scenes to evaluate (default: coffee_martini).")
-    parser.add_argument("--methods",          nargs="+", type=str, default=ALL_METHODS,
-                        choices=ALL_METHODS,
-                        help="Methods to run (default: all five).")
+    # ── Method selection: --method (single) OR --methods (subset/all) ────────
+    method_group = parser.add_mutually_exclusive_group()
+    method_group.add_argument(
+        "--method", type=str, default=None, choices=ALL_METHODS,
+        help="Run a single method end-to-end (train → render → metrics).",
+    )
+    method_group.add_argument(
+        "--methods", nargs="+", type=str, default=ALL_METHODS, choices=ALL_METHODS,
+        help="Run an explicit subset of methods (default: all).",
+    )
     parser.add_argument("--render_iteration", type=int,  default=-1,
                         help="Iteration to render (-1 = latest checkpoint).")
     parser.add_argument("--skip_training",    action="store_true")
@@ -498,6 +680,16 @@ if __name__ == "__main__":
     parser.add_argument("--eval_flow",        action="store_true",
                         help="Include optical-flow EPE in metrics (requires RAFT).")
     args = parser.parse_args()
+
+    # Resolve --method (single shorthand) → args.methods
+    if args.method is not None:
+        args.methods = [args.method]
+
+    # ── Hardware info ─────────────────────────────────────────────────────────
+    print(f"\n[hardware] GPU  : {_GPU_NAME}")
+    print(f"[hardware] Mode : {'RTX 4090 high-performance' if _IS_HIGH_MEM else 'standard (RTX 3060 / other)'}")
+    print(f"[hardware] batch_size per training step: {_BATCH_SIZE}")
+    print(f"[hardware] Methods to run: {args.methods}")
 
     # ── Training ──────────────────────────────────────────────────────────
     if not args.skip_training:
@@ -516,7 +708,15 @@ if __name__ == "__main__":
                     print(f"\n[render] SKIP {method}/{scene}  (rendered images already exist)")
                 else:
                     render_method(method, scene, args.output_root, args.render_iteration)
-
+    # ── Sample extraction (first rendered frame per camera pose) ──────────────
+    # Runs unconditionally (not gated by --skip_rendering) so that a run
+    # interrupted between rendering and sample extraction resumes cleanly.
+    for method in args.methods:
+        for scene in args.scenes:
+            if is_samples_done(method, scene, args.output_root):
+                print(f"\n[sample] SKIP {method}/{scene}  (samples already exist)")
+            else:
+                sample_method(method, scene, args.output_root)
     # ── Metrics ───────────────────────────────────────────────────────────
     if not args.skip_metrics:
         for method in args.methods:

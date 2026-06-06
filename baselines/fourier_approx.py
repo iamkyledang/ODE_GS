@@ -95,7 +95,8 @@ class GaussianModel:
     """
 
     # Number of Fourier frequency components
-    K = 4
+    # Reference: EfficientDynamic3DGaussian (raven38) uses approx_l=2
+    K = 2
 
     # ------------------------------------------------------------------ setup
 
@@ -249,10 +250,17 @@ class GaussianModel:
         return self._xyz + d_xyz, self._scaling + d_scale, self._rotation + d_rot
 
     def compute_ode_regulation(self) -> torch.Tensor:
-        """L2 regularisation on Fourier coefficients to encourage smoothness."""
-        reg = (self._fourier_pos   ** 2).mean() + \
-              (self._fourier_rot   ** 2).mean() + \
-              (self._fourier_scale ** 2).mean()
+        """
+        L1 (lasso) regularisation on Fourier coefficients.
+
+        Matching EfficientDynamic3DGaussian which uses lambda_lasso on higher-order
+        terms (coefficients beyond the dc component, i.e. k >= 1).
+        L1 encourages sparse frequency usage; L2 would damp all equally.
+        """
+        # All 2K coefficient tensors — lasso on the full set
+        reg = self._fourier_pos.abs().mean() + \
+              self._fourier_rot.abs().mean() + \
+              self._fourier_scale.abs().mean()
         return reg
 
     # ---------------------------------------------------------------- training setup

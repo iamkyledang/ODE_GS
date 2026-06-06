@@ -12,6 +12,7 @@ import copy
 import imageio
 import json
 import numpy as np
+import shutil
 import torch
 from scene import Scene
 import os
@@ -31,7 +32,7 @@ def _get_gaussian_model_class(model_class: str):
     Return the GaussianModel class for the requested model variant.
 
     Values: ode (default), deformable_mlp, deformable_hexplane_mlp,
-            fourier_approx, polynomial_approx.
+            fourier_approx, polynomial_approx, neural_ode.
     """
     if model_class in (None, "", "ode"):
         from scene.gaussian_model import GaussianModel as _GM
@@ -43,6 +44,8 @@ def _get_gaussian_model_class(model_class: str):
         from baselines.fourier_approx import GaussianModel as _GM
     elif model_class == "polynomial_approx":
         from baselines.polynomial_approx import GaussianModel as _GM
+    elif model_class == "neural_ode":
+        from baselines.neural_ode import GaussianModel as _GM
     else:
         raise ValueError(f"Unknown --model_class: {model_class!r}")
     return _GM
@@ -184,6 +187,54 @@ def multithread_write(image_list, path):
     
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
+
+def extract_samples(renders_dir, sample_dir):
+    """
+    Extract the first rendered frame per camera pose from a test renders directory.
+
+    Reads cameras_metadata.json (written by render_set) to identify which frames
+    belong to which camera, then copies the earliest-timestep frame for each
+    camera into sample_dir as pose_1.png, pose_2.png, ... (sorted by camera name).
+
+    Args:
+        renders_dir: path to <model>/test/ours_N/renders/
+        sample_dir:  destination directory (created if absent)
+
+    Returns:
+        Number of pose images written, or 0 if cameras_metadata.json is missing.
+    """
+    meta_path = os.path.join(renders_dir, "cameras_metadata.json")
+    if not os.path.exists(meta_path):
+        print(f"[sample] cameras_metadata.json not found in {renders_dir} — skipping.")
+        return 0
+
+    with open(meta_path) as f:
+        cam_meta = json.load(f)  # {"00000.png": "cam00", ...}
+
+    # Group filenames by camera name
+    cam_frames: dict = {}
+    for fname, cam_name in cam_meta.items():
+        cam_frames.setdefault(cam_name, []).append(fname)
+
+    if not cam_frames:
+        return 0
+
+    os.makedirs(sample_dir, exist_ok=True)
+
+    sorted_cams = sorted(cam_frames.keys())
+    count = 0
+    for pose_idx, cam_name in enumerate(sorted_cams, start=1):
+        # The first frame = lexicographically smallest filename = earliest timestep
+        first_frame = sorted(cam_frames[cam_name])[0]
+        src = os.path.join(renders_dir, first_frame)
+        dst = os.path.join(sample_dir, f"pose_{pose_idx}.png")
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            count += 1
+
+    return count
+
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, cam_type, render_fn=None):
     if render_fn is None:
         render_fn = render
@@ -245,6 +296,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         meta_path = os.path.join(render_path, "cameras_metadata.json")
         with open(meta_path, "w") as f:
             json.dump(cam_names_dict, f, indent=2)
+
+    # Extract one sample image per camera pose into <model_path>/sample/
+    if name == "test":
+        sample_dir = os.path.join(model_path, "sample")
+        n = extract_samples(render_path, sample_dir)
+        if n > 0:
+            # Write sentinel so full_eval.py's is_samples_done() is unambiguous
+            with open(os.path.join(sample_dir, ".done"), "w") as _f:
+                _f.write(f"{n} poses\n")
+            print(f"[sample] {n} pose image(s) saved to {sample_dir}")
 
     imageio.mimwrite(
         os.path.join(model_path, name, "ours_{}".format(iteration), "video_rgb.mp4"),
