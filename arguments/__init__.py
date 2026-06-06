@@ -135,7 +135,13 @@ class ODEModelParams(ParamGroup):
         # ── Fourier approximation baseline arch param ───────────────────────
         self.fourier_K = 4    # number of Fourier frequency components
         # ── Polynomial approximation baseline arch param ────────────────────
-        self.poly_D    = 4    # polynomial degree (terms tau^1 … tau^D)
+        self.poly_D    = 3    # polynomial degree (terms tau^1 … tau^D); matches Gaussian-Flow traj_dim=3
+        # ── Neural ODE velocity field baseline arch params ──────────────────────
+        self.neural_ode_width   = 128   # velocity MLP hidden width  (evogs net_width default for dynerf)
+        self.neural_ode_depth   = 1     # velocity MLP hidden layers (evogs defor_depth)
+        self.neural_ode_pos_pe  = 10    # positional encoding frequencies for xyz (evogs posebase_pe)
+        self.neural_ode_time_pe = 4     # positional encoding frequencies for t   (evogs timebase_pe)
+        self.neural_ode_steps   = 4     # Euler integration steps
         super().__init__(parser, "ODE Model Parameters")
 
 
@@ -155,15 +161,23 @@ class ODEOptimizationParams(ParamGroup):
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 20_000
-        # Per-Gaussian ODE parameter learning rates
-        self.ode_lr_init = 0.0001
-        self.ode_lr_final = 0.00001
+        # LR schedule spans ~2/3 of a typical 30k–100k training run;
+        # both xyz and ODE params share this decay schedule.
+        self.position_lr_max_steps = 30_000
+        # Per-Gaussian ODE parameter learning rates.
+        # The effective LR is ode_lr_init * spatial_lr_scale (~5 for indoor).
+        # 0.001 gives ~5e-3 effective LR, enough for the 21 ODE params
+        # (A_flat, b, x0, kappa, omega_cov) to learn meaningful dynamics.
+        self.ode_lr_init = 0.001
+        self.ode_lr_final = 0.0001
         self.ode_lr_delay_mult = 0.01
-        # Standard Gaussian attribute learning rates
+        # Standard Gaussian attribute learning rates.
+        # Lower scaling_lr (0.001 vs vanilla 0.005) because covariance
+        # evolution is handled by the kappa/omega_cov ODE params —
+        # the canonical scale should be stable.
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
-        self.scaling_lr = 0.005
+        self.scaling_lr = 0.001
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2

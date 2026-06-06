@@ -44,6 +44,7 @@ import os
 import re
 import json
 import shutil
+import time
 import numpy as np
 import torch
 from argparse import ArgumentParser
@@ -61,7 +62,16 @@ def _detect_high_mem_gpu() -> bool:
     return "4090" in torch.cuda.get_device_name(0).lower()
 
 
-_IS_HIGH_MEM: bool = _detect_high_mem_gpu()
+def _detect_rtx3060_laptop() -> bool:
+    """Return True when the active GPU is an NVIDIA GeForce RTX 3060 Laptop GPU."""
+    if not torch.cuda.is_available():
+        return False
+    name = torch.cuda.get_device_name(0).lower()
+    return "3060" in name and "laptop" in name
+
+
+_IS_HIGH_MEM:     bool = _detect_high_mem_gpu()
+_IS_3060_LAPTOP:  bool = _detect_rtx3060_laptop()
 _GPU_NAME:    str  = (
     torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU (no CUDA)"
 )
@@ -94,8 +104,20 @@ _BASE_FLAGS = (
     "--opacity_threshold_coarse 0.005 "
     "--opacity_threshold_fine_init 0.005 "
     "--opacity_threshold_fine_after 0.005 "
+    "--port 0 "  # port 0 → OS picks a free ephemeral port; avoids EADDRINUSE on re-runs
     "--quiet"
 )
+
+# ── RTX 3060 Laptop memory-saving overrides ───────────────────────────────
+# Higher densification gradient thresholds mean fewer Gaussians are split per
+# interval → peak VRAM stays below 6 GB.  The coarse threshold governs the
+# first 3 k iters where the OOM was hitting; doubling it (0.0002 → 0.0004)
+# roughly halves the rate of Gaussian growth while preserving final quality.
+_3060_MEM_FLAGS: str = (
+    "--densify_grad_threshold_coarse 0.0004 "
+    "--densify_grad_threshold_fine_init 0.0004 "
+    "--densify_grad_threshold_after 0.0004 "
+) if _IS_3060_LAPTOP else ""
 
 METHOD_CONFIGS = {
     # ── Proposed: ODE deformation ──────────────────────────────────────────
@@ -130,6 +152,7 @@ METHOD_CONFIGS = {
             "--plane_tv_weight 0.0 "
             "--time_smoothness_weight 0.0 "
             "--l1_time_planes 0.0 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -160,6 +183,7 @@ METHOD_CONFIGS = {
             "--deform_mlp_depth 8 "
             "--deform_pos_pe 10 "
             "--deform_time_pe 4 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -189,6 +213,7 @@ METHOD_CONFIGS = {
             "--hexplane_feat_dim 16 "
             "--hexplane_decode_W 128 "
             "--hexplane_decode_D 0 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -209,6 +234,7 @@ METHOD_CONFIGS = {
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
             "--fourier_K 2 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -229,6 +255,7 @@ METHOD_CONFIGS = {
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
             "--poly_D 3 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -255,6 +282,7 @@ METHOD_CONFIGS = {
             "--neural_ode_pos_pe 10 "
             "--neural_ode_time_pe 4 "
             "--neural_ode_steps 4 "
+            + _3060_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -330,6 +358,93 @@ def is_samples_done(method: str, scene: str, output_root: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Training-time helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_time(seconds: float) -> str:
+    """Format elapsed seconds as a human-readable string (e.g. '1h 23m', '45m 07s')."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+_TRAINING_TIME_FILE = "training_time.json"
+_RENDER_TIME_FILE   = "render_time.json"
+
+
+def _save_training_time(method: str, scene: str, output_root: str, elapsed_s: float):
+    """Persist training duration to <output_root>/<method>/<scene>/training_time.json."""
+    out_dir = Path(output_root) / method / scene
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / _TRAINING_TIME_FILE, "w") as f:
+        json.dump({"seconds": round(elapsed_s, 1), "formatted": _fmt_time(elapsed_s)}, f)
+
+
+def _load_training_time(method: str, scene: str, output_root: str) -> dict:
+    """Return {"seconds": X, "formatted": "Xh Ym"}, or {} if not yet recorded."""
+    p = Path(output_root) / method / scene / _TRAINING_TIME_FILE
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_render_time(method: str, scene: str, output_root: str, elapsed_s: float):
+    """Persist rendering duration to <output_root>/<method>/<scene>/render_time.json."""
+    out_dir = Path(output_root) / method / scene
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / _RENDER_TIME_FILE, "w") as f:
+        json.dump({"seconds": round(elapsed_s, 1), "formatted": _fmt_time(elapsed_s)}, f)
+
+
+def _load_render_time(method: str, scene: str, output_root: str) -> dict:
+    """Return {"seconds": X, "formatted": "Xh Ym"}, or {} if not yet recorded."""
+    p = Path(output_root) / method / scene / _RENDER_TIME_FILE
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _patch_results_json(method: str, scene: str, output_root: str):
+    """
+    Inject training_time and render_time into the per-method results.json.
+    Each field is written only if the corresponding *_time.json file exists
+    (i.e. the phase was actually run), so skipped phases stay absent.
+    Safe to call unconditionally — no-op when results.json is missing.
+    """
+    results_path = Path(output_root) / method / scene / "results.json"
+    if not results_path.exists():
+        return
+    try:
+        with open(results_path) as f:
+            data = json.load(f)
+        tt = _load_training_time(method, scene, output_root)
+        rt = _load_render_time(method, scene, output_root)
+        if tt:
+            data["training_time_s"] = tt["seconds"]
+            data["training_time"]   = tt["formatted"]
+        if rt:
+            data["render_time_s"] = rt["seconds"]
+            data["render_time"]   = rt["formatted"]
+        with open(results_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -348,9 +463,16 @@ def train_method(method: str, scene: str, data_root: str, output_root: str):
     )
     print(f"\n[train] {method}/{scene}")
     print(f"  {cmd}")
+    t0  = time.time()
     ret = os.system(cmd)
+    elapsed = time.time() - t0
+    # Only record time when training actually completed (avoids misleading
+    # timings from crashed or OOM runs)
+    if ret == 0 or is_training_done(method, scene, output_root):
+        _save_training_time(method, scene, output_root, elapsed)
     if ret != 0:
         print(f"  [WARNING] Training returned non-zero exit code {ret}")
+    print(f"  [time] training took {_fmt_time(elapsed)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,9 +496,15 @@ def render_method(method: str, scene: str, output_root: str, iteration: int = -1
     )
     print(f"\n[render] {method}/{scene}")
     print(f"  {cmd}")
-    ret = os.system(cmd)
+    t0      = time.time()
+    ret     = os.system(cmd)
+    elapsed = time.time() - t0
+    # Only record time when rendering actually completed
+    if ret == 0 or is_rendering_done(method, scene, output_root):
+        _save_render_time(method, scene, output_root, elapsed)
     if ret != 0:
         print(f"  [WARNING] Rendering returned non-zero exit code {ret}")
+    print(f"  [time] rendering took {_fmt_time(elapsed)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,9 +605,15 @@ def load_results(method: str, scene: str, output_root: str) -> dict:
         bucket = train_acc if key.startswith("train_") else test_acc
         for metric, v in sub.items():
             bucket.setdefault(metric, []).append(v)
+    tt = _load_training_time(method, scene, output_root)
+    rt = _load_render_time(method, scene, output_root)
     return {
         "test":  {k: float(np.mean(v)) for k, v in test_acc.items()},
         "train": {k: float(np.mean(v)) for k, v in train_acc.items()},
+        "training_time":   tt.get("formatted", "N/A"),
+        "training_time_s": tt.get("seconds"),
+        "render_time":     rt.get("formatted", "N/A"),
+        "render_time_s":   rt.get("seconds"),
     }
 
 
@@ -524,17 +658,25 @@ def print_comparison_table(methods: list, scenes: list, merged: dict,
     if metrics is None:
         metrics = METRICS
     col_w  = 11
+    time_w = 12
     lbl_w  = 28  # method + split label width
-    width  = lbl_w + col_w * len(metrics)
+    width  = lbl_w + col_w * len(metrics) + time_w * 2
 
     for scene in scenes:
         print("\n" + "=" * width)
         print(f"BASELINE COMPARISON  —  {scene}")
         print("=" * width)
-        header = f"  {'Method / Split':<{lbl_w-2}}" + "".join(f"  {m:>{col_w-2}}" for m in metrics)
+        header = (
+            f"  {'Method / Split':<{lbl_w-2}}"
+            + "".join(f"  {m:>{col_w-2}}" for m in metrics)
+            + f"  {'Train Time':>{time_w-2}}"
+            + f"  {'Render Time':>{time_w-2}}"
+        )
         print(header)
         for method in methods:
-            print("  " + "-" * (lbl_w - 2 + col_w * len(metrics)))
+            print("  " + "-" * (lbl_w - 2 + col_w * len(metrics) + time_w * 2))
+            tt = merged.get(scene, {}).get(method, {}).get("training_time", "N/A")
+            rt = merged.get(scene, {}).get(method, {}).get("render_time",   "N/A")
             for split in ["test", "train"]:
                 res   = merged.get(scene, {}).get(method, {}).get(split, {})
                 label = f"{method} [{split}]"
@@ -542,6 +684,9 @@ def print_comparison_table(methods: list, scenes: list, merged: dict,
                 for m in metrics:
                     v = res.get(m)
                     row += f"  {v:>{col_w-2}.4f}" if v is not None else f"  {'N/A':>{col_w-2}}"
+                # Train time belongs to the train split; render time to the test split
+                row += f"  {(tt if split == 'train' else ''):>{time_w-2}}"
+                row += f"  {(rt if split == 'test'  else ''):>{time_w-2}}"
                 print(row)
 
     print("\n" + "=" * width)
@@ -569,6 +714,7 @@ def save_comparison_table_image(methods: list, scenes: list, merged: dict,
 
     if metrics is None:
         metrics = METRICS
+    display_metrics = list(metrics) + ["Train Time", "Render Time"]
 
     # Build rows: two rows per method (test + train) per scene
     row_labels  = []
@@ -577,17 +723,22 @@ def save_comparison_table_image(methods: list, scenes: list, merged: dict,
 
     for s_idx, scene in enumerate(scenes):
         for method in methods:
+            tt = merged.get(scene, {}).get(method, {}).get("training_time", "N/A")
+            rt = merged.get(scene, {}).get(method, {}).get("render_time",   "N/A")
             for split in ["test", "train"]:
                 res = merged.get(scene, {}).get(method, {}).get(split, {})
                 row_labels.append(f"{method}\n[{split}]")
+                # Train time belongs to the train split; render time to the test split
+                tt_cell = tt if split == "train" else ""
+                rt_cell = rt if split == "test"  else ""
                 cell_values.append([
                     f"{res[m]:.4f}" if res.get(m) is not None else "N/A"
                     for m in metrics
-                ])
+                ] + [tt_cell, rt_cell])
                 row_meta.append((s_idx, split))
 
     n_rows = len(row_labels)
-    n_cols = len(metrics)
+    n_cols = len(display_metrics)
 
     fig_height = max(4, n_rows * 0.45 + 1.5)
     fig_width  = max(10, n_cols * 1.8 + 3.0)
@@ -598,7 +749,7 @@ def save_comparison_table_image(methods: list, scenes: list, merged: dict,
     tbl = ax.table(
         cellText=cell_values,
         rowLabels=row_labels,
-        colLabels=metrics,
+        colLabels=display_metrics,
         loc="center",
         cellLoc="center",
     )
@@ -613,7 +764,6 @@ def save_comparison_table_image(methods: list, scenes: list, merged: dict,
 
     # Colour rows: alternating per method-block; test slightly darker than train
     scene_base = ["#dce8ff", "#ffeedd"]
-    split_shade = {"test": 0, "train": 40}   # lighten train row
     for r_idx, (s_idx, split) in enumerate(row_meta):
         base = scene_base[s_idx % len(scene_base)]
         if split == "train":
@@ -687,12 +837,30 @@ if __name__ == "__main__":
 
     # ── Hardware info ─────────────────────────────────────────────────────────
     print(f"\n[hardware] GPU  : {_GPU_NAME}")
-    print(f"[hardware] Mode : {'RTX 4090 high-performance' if _IS_HIGH_MEM else 'standard (RTX 3060 / other)'}")
+    if _IS_HIGH_MEM:
+        _mode_str = "RTX 4090 high-performance (batch=2, pin_memory, 16 workers, 360k Gaussians)"
+    elif _IS_3060_LAPTOP:
+        _mode_str = "RTX 3060 Laptop OOM-safe (batch=1, 4 workers, 150k Gaussians, dense cache flush)"
+    else:
+        _mode_str = "standard (batch=1, 8 workers)"
+    print(f"[hardware] Mode : {_mode_str}")
     print(f"[hardware] batch_size per training step: {_BATCH_SIZE}")
+    if _IS_3060_LAPTOP:
+        print(f"[hardware] 3060 densify threshold override: {_3060_MEM_FLAGS.strip()}")
     print(f"[hardware] Methods to run: {args.methods}")
 
     # ── Training ──────────────────────────────────────────────────────────
     if not args.skip_training:
+        # On the RTX 3060 Laptop, wipe previous output so each run starts
+        # from a clean slate (avoids stale checkpoints confusing resume logic).
+        # On other GPUs the resume logic is left intact.
+        if _IS_3060_LAPTOP:
+            for method in args.methods:
+                for scene in args.scenes:
+                    out_dir = Path(args.output_root) / method / scene
+                    if out_dir.exists():
+                        print(f"\n[clean] Removing old output: {out_dir}")
+                        shutil.rmtree(out_dir)
         for method in args.methods:
             for scene in args.scenes:
                 if is_training_done(method, scene, args.output_root):
@@ -725,6 +893,13 @@ if __name__ == "__main__":
                     print(f"\n[metrics] SKIP {method}/{scene}  (results.json already exists)")
                 else:
                     run_metrics(method, scene, args.output_root, eval_flow=args.eval_flow)
+
+    # Always patch training_time into each per-method results.json (no-op when
+    # either file is absent).  Runs outside the skip_metrics gate so the time
+    # is recorded even when metrics were skipped or computed in a prior run.
+    for method in args.methods:
+        for scene in args.scenes:
+            _patch_results_json(method, scene, args.output_root)
 
     # ── Merge + save result.json ──────────────────────────────────────────
     merged = merge_results(args.methods, args.scenes, args.output_root)
