@@ -261,11 +261,12 @@ def save_flow_visualizations(per_camera_errors, out_dir):
     global_mean  = float(np.mean(all_flat)) if all_flat else 0.0
 
     # 1. Per-camera error curves
+    _MAX_FIG_W = 200  # inches cap — avoids Pillow's 2^16 px limit at 150 dpi
     for cam_name, errors in per_camera_errors.items():
         if not errors:
             continue
         cam_mean = float(np.mean(errors))
-        fig, ax = plt.subplots(figsize=(max(8, len(errors) // 4), 4))
+        fig, ax = plt.subplots(figsize=(min(_MAX_FIG_W, max(8, len(errors) // 4)), 4))
         ax.plot(range(len(errors)), errors, color="steelblue", linewidth=1.2,
                 marker="o", markersize=3)
         ax.axhline(cam_mean, color="red", linestyle="--",
@@ -284,7 +285,7 @@ def save_flow_visualizations(per_camera_errors, out_dir):
         float(np.mean(per_camera_errors[c])) if per_camera_errors[c] else 0.0
         for c in cam_names
     ]
-    fig, ax = plt.subplots(figsize=(max(6, len(cam_names) * 1.2), 5))
+    fig, ax = plt.subplots(figsize=(min(_MAX_FIG_W, max(6, len(cam_names) * 1.2)), 5))
     ax.bar(cam_names, cam_means, color="steelblue", alpha=0.85, edgecolor="white")
     ax.axhline(global_mean, color="red", linestyle="--",
                label=f"global mean = {global_mean:.4f}")
@@ -306,7 +307,7 @@ def save_flow_visualizations(per_camera_errors, out_dir):
         heatmap[i, :len(errs)] = errs
 
     fig_h = max(2, len(cam_names) * 0.6)
-    fig_w = max(10, max_frames * 0.2)
+    fig_w = min(_MAX_FIG_W, max(10, max_frames * 0.2))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     vmax = float(np.nanpercentile(heatmap, 99)) if not np.all(np.isnan(heatmap)) else 1.0
     im = ax.imshow(heatmap, aspect="auto", cmap="hot_r", vmin=0, vmax=vmax,
@@ -443,6 +444,7 @@ def save_flow_visualizations_per_cam_subdirs(per_camera_errors, out_dir):
     global_mean = float(np.mean(all_flat)) if all_flat else 0.0
 
     # 1. Per-camera error curves — each in its own sub-directory
+    _MAX_FIG_W = 200  # inches cap — avoids Pillow's 2^16 px limit at 150 dpi
     for cam_name, errors in per_camera_errors.items():
         if not errors:
             continue
@@ -450,7 +452,7 @@ def save_flow_visualizations_per_cam_subdirs(per_camera_errors, out_dir):
         cam_dir.mkdir(parents=True, exist_ok=True)
 
         cam_mean = float(np.mean(errors))
-        fig, ax = plt.subplots(figsize=(max(8, len(errors) // 4), 4))
+        fig, ax = plt.subplots(figsize=(min(_MAX_FIG_W, max(8, len(errors) // 4)), 4))
         ax.plot(range(len(errors)), errors, color="steelblue", linewidth=1.2,
                 marker="o", markersize=3)
         ax.axhline(cam_mean, color="red", linestyle="--",
@@ -491,7 +493,7 @@ def save_flow_visualizations_per_cam_subdirs(per_camera_errors, out_dir):
         heatmap[i, :len(errs)] = errs
 
     fig_h = max(2, len(cam_names) * 0.6)
-    fig_w = max(10, max_frames * 0.2)
+    fig_w = min(_MAX_FIG_W, max(10, max_frames * 0.2))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     vmax = float(np.nanpercentile(heatmap, 99)) if not np.all(np.isnan(heatmap)) else 1.0
     im = ax.imshow(heatmap, aspect="auto", cmap="hot_r", vmin=0, vmax=vmax,
@@ -532,13 +534,15 @@ def save_metric_plots(per_view, out_dir):
         ("LPIPS-alex", "LPIPS-alex (lower=better)", "tomato"),
     ]
 
+    # Cap figure width: at 150 dpi Pillow rejects images wider than 2^16 px
+    _MAX_FIG_W = 200  # inches → 30 000 px @ 150 dpi, well below the 65 535 limit
     for metric, ylabel, color in plot_specs:
         if metric not in per_view:
             continue
         values = list(per_view[metric].values())
         names  = list(per_view[metric].keys())
         x      = range(len(values))
-        fig, ax = plt.subplots(figsize=(max(8, len(values) // 4), 4))
+        fig, ax = plt.subplots(figsize=(min(_MAX_FIG_W, max(8, len(values) // 4)), 4))
         ax.plot(x, values, color=color, linewidth=1.2, marker="o", markersize=2)
         ax.axhline(float(np.mean(values)), color="black", linestyle="--", linewidth=0.8,
                    label=f"mean = {np.mean(values):.4f}")
@@ -604,34 +608,38 @@ def evaluate(model_paths, eval_flow=False, model_type=None):
                     print("\n  Test metrics summary:")
                     for k, v in test_summary.items():
                         print(f"    {k:12s}: {v:.5f}")
-                    save_metric_plots(test_per_view, test_viz)
-                    test_flow = {}
-                    flow_pv: dict = {}
-                    if eval_flow:
-                        mean_flow, per_frame, per_camera = compute_flow_error(
-                            renders_dir, gt_dir
-                        )
-                        if mean_flow is not None:
-                            test_flow["flow_EPE_mean"] = mean_flow
-                            test_flow["flow_EPE_per_camera"] = {
-                                cam: float(np.mean(errs))
-                                for cam, errs in per_camera.items() if errs
-                            }
-                            flow_pv = {
-                                cam: [float(e) for e in errs]
-                                for cam, errs in per_camera.items()
-                            }
-                            print(f"    flow_EPE    : {mean_flow:.5f}")
-                            save_flow_visualizations_per_cam_subdirs(
-                                per_camera, test_viz / "flow"
-                            )
-                    full_dict[f"test_{method}"] = {**test_summary, **test_flow}
-                    pv_dict[f"test_{method}"]   = {
-                        **test_per_view,
-                        **(({"flow_EPE": flow_pv}) if flow_pv else {}),
-                    }
+                    # Populate results immediately so viz/flow errors cannot lose metrics
+                    full_dict[f"test_{method}"] = dict(test_summary)
+                    pv_dict[f"test_{method}"]   = dict(test_per_view)
                 except Exception as e:
                     print(f"  [test metrics error] {e}")
+                else:
+                    try:
+                        save_metric_plots(test_per_view, test_viz)
+                    except Exception as e:
+                        print(f"  [test viz warning] {e}")
+                    if eval_flow:
+                        try:
+                            mean_flow, per_frame, per_camera = compute_flow_error(
+                                renders_dir, gt_dir
+                            )
+                            if mean_flow is not None:
+                                full_dict[f"test_{method}"]["flow_EPE_mean"] = mean_flow
+                                full_dict[f"test_{method}"]["flow_EPE_per_camera"] = {
+                                    cam: float(np.mean(errs))
+                                    for cam, errs in per_camera.items() if errs
+                                }
+                                flow_pv = {
+                                    cam: [float(e) for e in errs]
+                                    for cam, errs in per_camera.items()
+                                }
+                                pv_dict[f"test_{method}"]["flow_EPE"] = flow_pv
+                                print(f"    flow_EPE    : {mean_flow:.5f}")
+                                save_flow_visualizations_per_cam_subdirs(
+                                    per_camera, test_viz / "flow"
+                                )
+                        except Exception as e:
+                            print(f"  [test flow error] {e}")
 
         # Write JSON results
         with open(os.path.join(scene_dir, "results.json"), "w") as fp:
