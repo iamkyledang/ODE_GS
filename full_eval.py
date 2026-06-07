@@ -301,14 +301,19 @@ def is_rendering_done(method: str, scene: str, output_root: str) -> bool:
 
 
 def is_metrics_done(method: str, scene: str, output_root: str) -> bool:
-    """Metrics are done when a non-empty results.json exists."""
+    """
+    Metrics are done when results.json contains at least one key whose value is
+    a dict (an actual metric result sub-object).  Top-level scalar fields added
+    by _patch_results_json (training_time_s, render_time_s, …) are intentionally
+    ignored so a partially-written file is not mistaken for complete metrics.
+    """
     results = Path(output_root) / method / scene / "results.json"
     if not results.exists():
         return False
     try:
         with open(results) as f:
             data = json.load(f)
-        return bool(data)
+        return any(isinstance(v, dict) for v in data.values())
     except (json.JSONDecodeError, OSError):
         return False
 
