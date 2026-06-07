@@ -39,25 +39,9 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser
 from pytorch_msssim import ms_ssim
 import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# GPU capability detection
-# ---------------------------------------------------------------------------
-
-def _is_high_memory_gpu() -> bool:
-    """Return True when a high-VRAM GPU (e.g. RTX 4090 with 24 GB) is detected."""
-    if not torch.cuda.is_available():
-        return False
-    name = torch.cuda.get_device_name(0).lower()
-    return "4090" in name
-
-_HIGH_MEM: bool = _is_high_memory_gpu()
-if _HIGH_MEM:
-    print("[metrics] RTX 4090 detected — using high-memory mode "
-          "(LPIPS on GPU, reduced cache clearing).")
-else:
-    print("[metrics] Standard GPU detected — using memory-conservative mode.")
+from gpu import GPU_CFG, apply_torch_global_settings, log_gpu_info
+apply_torch_global_settings()
+log_gpu_info()
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +73,7 @@ def compute_rendering_metrics(renders_dir, gt_dir):
         raise FileNotFoundError(f"No matching image pairs in {renders_dir} and {gt_dir}")
 
     from lpipsPyTorch.modules.lpips import LPIPS as _LPIPS
-    if _HIGH_MEM:
+    if GPU_CFG.lpips_on_gpu:
         lpips_vgg_net  = _LPIPS(net_type="vgg").cuda().eval()
         lpips_alex_net = _LPIPS(net_type="alex").cuda().eval()
     else:
@@ -108,7 +92,7 @@ def compute_rendering_metrics(renders_dir, gt_dir):
             ssims_l.append(ssim(render_gpu, gt_gpu).item())
             psnrs_l.append(psnr(render_gpu, gt_gpu).item())
             ms_ssims_l.append(ms_ssim(render_gpu, gt_gpu, data_range=1, size_average=True).item())
-            if _HIGH_MEM:
+            if GPU_CFG.lpips_on_gpu:
                 lpips_vgg_l.append(lpips_vgg_net(render_gpu, gt_gpu).item())
                 lpips_alex_l.append(lpips_alex_net(render_gpu, gt_gpu).item())
             else:
@@ -120,7 +104,7 @@ def compute_rendering_metrics(renders_dir, gt_dir):
             names.append(Path(render_path).stem)
 
     del lpips_vgg_net, lpips_alex_net
-    if _HIGH_MEM:
+    if GPU_CFG.lpips_on_gpu:
         torch.cuda.empty_cache()
     dssims_l = [(1.0 - v) / 2.0 for v in ms_ssims_l]
 
@@ -242,10 +226,10 @@ def compute_flow_error(renders_dir, gt_dir):
             err = (flow_r - flow_g).norm(dim=1).mean().item()  # EPE
             cam_errors.append(err)
             all_errors.append(err)
-            if not _HIGH_MEM:
+            if GPU_CFG.metrics_cache_clear == "per_image":
                 del r_a, r_b, g_a, g_b, flow_r, flow_g
                 torch.cuda.empty_cache()
-        if _HIGH_MEM:
+        if GPU_CFG.metrics_cache_clear == "per_camera":
             torch.cuda.empty_cache()  # flush once per camera, not per frame
         per_camera_errors[cam_name] = cam_errors
 
@@ -377,7 +361,7 @@ def compute_rendering_metrics_per_camera(renders_dir, gt_dir):
         return [], {}
 
     from lpipsPyTorch.modules.lpips import LPIPS as _LPIPS
-    if _HIGH_MEM:
+    if GPU_CFG.lpips_on_gpu:
         lpips_vgg_net  = _LPIPS(net_type="vgg").cuda().eval()
         lpips_alex_net = _LPIPS(net_type="alex").cuda().eval()
     else:
@@ -402,7 +386,7 @@ def compute_rendering_metrics_per_camera(renders_dir, gt_dir):
                 ms_ssims_l.append(
                     ms_ssim(render_gpu, gt_gpu, data_range=1, size_average=True).item()
                 )
-                if _HIGH_MEM:
+                if GPU_CFG.lpips_on_gpu:
                     lpips_vgg_l.append(lpips_vgg_net(render_gpu, gt_gpu).item())
                     lpips_alex_l.append(lpips_alex_net(render_gpu, gt_gpu).item())
                 else:
@@ -421,7 +405,7 @@ def compute_rendering_metrics_per_camera(renders_dir, gt_dir):
         completed_cameras.append(cam_name)
 
     del lpips_vgg_net, lpips_alex_net
-    if _HIGH_MEM:
+    if GPU_CFG.lpips_on_gpu:
         torch.cuda.empty_cache()
     return completed_cameras, per_cam_results
 

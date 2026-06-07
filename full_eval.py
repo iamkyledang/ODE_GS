@@ -49,32 +49,8 @@ import numpy as np
 import torch
 from argparse import ArgumentParser
 from pathlib import Path
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Hardware detection — runs once at startup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _detect_high_mem_gpu() -> bool:
-    """Return True when an RTX 4090 (24 GB VRAM) is present."""
-    if not torch.cuda.is_available():
-        return False
-    return "4090" in torch.cuda.get_device_name(0).lower()
-
-
-def _detect_rtx3060_laptop() -> bool:
-    """Return True when the active GPU is an NVIDIA GeForce RTX 3060 Laptop GPU."""
-    if not torch.cuda.is_available():
-        return False
-    name = torch.cuda.get_device_name(0).lower()
-    return "3060" in name and "laptop" in name
-
-
-_IS_HIGH_MEM:     bool = _detect_high_mem_gpu()
-_IS_3060_LAPTOP:  bool = _detect_rtx3060_laptop()
-_GPU_NAME:    str  = (
-    torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU (no CUDA)"
-)
+from gpu import GPU_CFG, apply_torch_global_settings, log_gpu_info
+apply_torch_global_settings()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,32 +68,22 @@ DEFAULT_OUTPUT   = "output/output_baselines"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Shared base flags for MultipleView / coffee_martini.
-# batch_size scales with detected VRAM:
-#   RTX 4090 (24 GB) → batch_size=2: renders 2 cameras per gradient step,
-#     doubling data throughput without exceeding VRAM (Gaussians are shared).
-#   RTX 3060 (6 GB) / other → batch_size=1: conservative safe default.
-_BATCH_SIZE: int = 2 if _IS_HIGH_MEM else 1
-
+# All hardware-specific values (batch_size, num_workers, mem flags) come
+# from GPU_CFG so the configs below are always in sync with gpu.py.
 _BASE_FLAGS = (
     "--dataloader "
-    f"--batch_size {_BATCH_SIZE} "
+    f"--batch_size {GPU_CFG.batch_size} "
     "--opacity_threshold_coarse 0.005 "
     "--opacity_threshold_fine_init 0.005 "
     "--opacity_threshold_fine_after 0.005 "
-    "--port 0 "  # port 0 → OS picks a free ephemeral port; avoids EADDRINUSE on re-runs
-    "--quiet"
+    "--port 0 "  # port 0 -> OS picks a free ephemeral port; avoids EADDRINUSE on re-runs
+    + (f"{GPU_CFG.cli_num_workers_flag} " if GPU_CFG.cli_num_workers_flag else "")
+    + "--quiet"
 )
 
-# ── RTX 3060 Laptop memory-saving overrides ───────────────────────────────
-# Higher densification gradient thresholds mean fewer Gaussians are split per
-# interval → peak VRAM stays below 6 GB.  The coarse threshold governs the
-# first 3 k iters where the OOM was hitting; doubling it (0.0002 → 0.0004)
-# roughly halves the rate of Gaussian growth while preserving final quality.
-_3060_MEM_FLAGS: str = (
-    "--densify_grad_threshold_coarse 0.0004 "
-    "--densify_grad_threshold_fine_init 0.0004 "
-    "--densify_grad_threshold_after 0.0004 "
-) if _IS_3060_LAPTOP else ""
+# GPU-tier densification threshold overrides (empty string = use method defaults).
+# Sourced from GPU_CFG so LOW/HIGH/ULTRA configs are always synchronized.
+_GPU_MEM_FLAGS: str = GPU_CFG.cli_mem_flags
 
 METHOD_CONFIGS = {
     # ── Proposed: ODE deformation ──────────────────────────────────────────
@@ -152,7 +118,7 @@ METHOD_CONFIGS = {
             "--plane_tv_weight 0.0 "
             "--time_smoothness_weight 0.0 "
             "--l1_time_planes 0.0 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -183,7 +149,7 @@ METHOD_CONFIGS = {
             "--deform_mlp_depth 8 "
             "--deform_pos_pe 10 "
             "--deform_time_pe 4 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -213,7 +179,7 @@ METHOD_CONFIGS = {
             "--hexplane_feat_dim 16 "
             "--hexplane_decode_W 128 "
             "--hexplane_decode_D 0 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -234,7 +200,7 @@ METHOD_CONFIGS = {
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
             "--fourier_K 2 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -255,7 +221,7 @@ METHOD_CONFIGS = {
             "--bounds 1.6 "
             "--plane_tv_weight 0.0 "
             "--poly_D 3 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -282,7 +248,7 @@ METHOD_CONFIGS = {
             "--neural_ode_pos_pe 10 "
             "--neural_ode_time_pe 4 "
             "--neural_ode_steps 4 "
-            + _3060_MEM_FLAGS
+            + _GPU_MEM_FLAGS
             + _BASE_FLAGS
         ),
     ),
@@ -836,31 +802,15 @@ if __name__ == "__main__":
         args.methods = [args.method]
 
     # ── Hardware info ─────────────────────────────────────────────────────────
-    print(f"\n[hardware] GPU  : {_GPU_NAME}")
-    if _IS_HIGH_MEM:
-        _mode_str = "RTX 4090 high-performance (batch=2, pin_memory, 16 workers, 360k Gaussians)"
-    elif _IS_3060_LAPTOP:
-        _mode_str = "RTX 3060 Laptop OOM-safe (batch=1, 4 workers, 150k Gaussians, dense cache flush)"
-    else:
-        _mode_str = "standard (batch=1, 8 workers)"
-    print(f"[hardware] Mode : {_mode_str}")
-    print(f"[hardware] batch_size per training step: {_BATCH_SIZE}")
-    if _IS_3060_LAPTOP:
-        print(f"[hardware] 3060 densify threshold override: {_3060_MEM_FLAGS.strip()}")
+    log_gpu_info()
+    if _GPU_MEM_FLAGS:
+        print(f"[hardware] densify threshold flags: {_GPU_MEM_FLAGS.strip()}")
+    if GPU_CFG.cli_num_workers_flag:
+        print(f"[hardware] DataLoader workers override: {GPU_CFG.cli_num_workers_flag.strip()}")
     print(f"[hardware] Methods to run: {args.methods}")
 
     # ── Training ──────────────────────────────────────────────────────────
     if not args.skip_training:
-        # On the RTX 3060 Laptop, wipe previous output so each run starts
-        # from a clean slate (avoids stale checkpoints confusing resume logic).
-        # On other GPUs the resume logic is left intact.
-        if _IS_3060_LAPTOP:
-            for method in args.methods:
-                for scene in args.scenes:
-                    out_dir = Path(args.output_root) / method / scene
-                    if out_dir.exists():
-                        print(f"\n[clean] Removing old output: {out_dir}")
-                        shutil.rmtree(out_dir)
         for method in args.methods:
             for scene in args.scenes:
                 if is_training_done(method, scene, args.output_root):

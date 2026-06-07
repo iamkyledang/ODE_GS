@@ -12,33 +12,16 @@ import numpy as np
 import random
 import os, sys
 
-# ── CUDA memory allocator tuning (must be set before the first torch.cuda call).
-# max_split_size_mb:64  — caps block splits at 64 MB so the allocator recycles
-#   smaller fragments instead of holding one large slab per tensor; dramatically
-#   cuts fragmentation on 6 GB VRAM (RTX 3060 Laptop) where reserved >> allocated.
-# roundup_power2_divisions:4 — aligns allocations to 1/4 of the next power-of-2
-#   boundary, reducing wasted padding on heterogeneous-size requests (Gaussians
-#   grow via densification, so tensor sizes change every few hundred iterations).
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "max_split_size_mb:64,roundup_power2_divisions:4",
-)
+# ── Unified GPU configuration (must be imported before first CUDA allocation).
+# gpu.py detects the hardware tier (LOW / HIGH / ULTRA) and provides all
+# hardware-specific tuning knobs in one place.
+from gpu import GPU_CFG, apply_torch_global_settings, log_gpu_info
+apply_torch_global_settings()   # sets PYTORCH_CUDA_ALLOC_CONF + TF32 flags
 
 import gc
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
-
-
-def _is_rtx3060_laptop() -> bool:
-    """Return True when the active GPU is an NVIDIA GeForce RTX 3060 Laptop GPU."""
-    if not torch.cuda.is_available():
-        return False
-    name = torch.cuda.get_device_name(0).lower()
-    return "3060" in name and "laptop" in name
-
-
-_IS_3060_LAPTOP: bool = _is_rtx3060_laptop()
 from gaussian_renderer import render_ode, network_gui
 import sys
 from scene import Scene
@@ -82,54 +65,6 @@ from time import time
 import copy
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# GPU capability detection
-# ---------------------------------------------------------------------------
-
-def _is_high_memory_gpu() -> bool:
-    """Return True when a high-VRAM GPU (RTX 4090, 24 GB) is detected."""
-    if not torch.cuda.is_available():
-        return False
-    return "4090" in torch.cuda.get_device_name(0).lower()
-
-
-def _is_ampere_or_newer() -> bool:
-    """Return True for Ampere (CC 8.x) or newer GPUs — RTX 3060 Laptop is CC 8.6."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability(0)
-    return major >= 8
-
-
-_HIGH_MEM:   bool = _is_high_memory_gpu()
-_IS_AMPERE:  bool = _is_ampere_or_newer()
-
-# ── DataLoader worker count ───────────────────────────────────────────────────
-# RTX 3060 Laptop (6 GB): 4 workers — keeps CPU pinning overhead low and
-#   avoids the shared-memory pressure from 16 worker processes.
-# RTX 4090 (24 GB): 16 workers — maximises prefetch throughput to keep the
-#   GPU fed without stalling on data I/O.
-# Other GPUs: 8 workers as a safe middle-ground.
-_NUM_WORKERS: int = 4 if _IS_3060_LAPTOP else (16 if _HIGH_MEM else 8)
-
-# ── Maximum live Gaussians ────────────────────────────────────────────────────
-# RTX 3060 Laptop: cap at 150 k to stay within ~6 GB.  Densification growth
-#   is the primary VRAM driver; halving the ceiling cuts peak allocation by ~40%.
-# All others: 360 k (original limit).
-_MAX_GAUSSIANS: int = 150_000 if _IS_3060_LAPTOP else 360_000
-
-# ── Hardware-specific CUDA tuning ────────────────────────────────────────────────────────
-# cudnn.benchmark: cuDNN auto-tunes conv algorithms per observed input shape.
-torch.backends.cudnn.benchmark = True
-
-if _IS_AMPERE:
-    # TF32 matmul: ~1.5–3× faster on Ampere/Ada vs full FP32, with <0.1% error.
-    # Enabled for all Ampere+ GPUs (RTX 3060 Laptop = CC 8.6, RTX 4090 = CC 8.9).
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32  = True
-    torch.backends.cudnn.allow_tf32        = True
 
 
 try:
@@ -191,15 +126,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             sampler = FineSampler(viewpoint_stack)
             viewpoint_stack_loader = DataLoader(
                 viewpoint_stack, batch_size=batch_size, sampler=sampler,
-                num_workers=_NUM_WORKERS, collate_fn=list, pin_memory=_HIGH_MEM,
-                persistent_workers=(_NUM_WORKERS > 0),
+                num_workers=GPU_CFG.num_workers, collate_fn=list,
+                pin_memory=GPU_CFG.pin_memory,
+                persistent_workers=GPU_CFG.persistent_workers,
             )
             random_loader = False
         else:
             viewpoint_stack_loader = DataLoader(
                 viewpoint_stack, batch_size=batch_size, shuffle=True,
-                num_workers=_NUM_WORKERS, collate_fn=list, pin_memory=_HIGH_MEM,
-                persistent_workers=(_NUM_WORKERS > 0),
+                num_workers=GPU_CFG.num_workers, collate_fn=list,
+                pin_memory=GPU_CFG.pin_memory,
+                persistent_workers=GPU_CFG.persistent_workers,
             )
             random_loader = True
         loader = iter(viewpoint_stack_loader)
@@ -261,8 +198,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if not random_loader:
                     viewpoint_stack_loader = DataLoader(
                         viewpoint_stack, batch_size=opt.batch_size, shuffle=True,
-                        num_workers=_NUM_WORKERS, collate_fn=list, pin_memory=_HIGH_MEM,
-                        persistent_workers=(_NUM_WORKERS > 0),
+                        num_workers=GPU_CFG.num_workers, collate_fn=list,
+                        pin_memory=GPU_CFG.pin_memory,
+                        persistent_workers=GPU_CFG.persistent_workers,
                     )
                     random_loader = True
                 loader = iter(viewpoint_stack_loader)
@@ -324,16 +262,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if hyper.lambda_ode != 0:
                 loss += hyper.lambda_ode * gaussians.compute_ode_regulation()
         if opt.lambda_dssim != 0:
-            if _IS_3060_LAPTOP:
-                # On RTX 3060 Laptop (6 GB) downsample to 25 % area (0.5× each
-                # spatial dim) before SSIM to cut VRAM by ~4×.  Flush the
-                # allocator cache first so SSIM gets fresh unfragmented blocks.
+            if GPU_CFG.ssim_downsample_factor < 1.0:
+                # Downsample before SSIM to reduce its activation-buffer VRAM
+                # footprint.  Flush the allocator cache first so SSIM gets
+                # fresh unfragmented blocks.
                 torch.cuda.empty_cache()
                 _img_ssim = torch.nn.functional.interpolate(
-                    image_tensor, scale_factor=0.5, mode="bilinear", align_corners=False
+                    image_tensor,
+                    scale_factor=GPU_CFG.ssim_downsample_factor,
+                    mode="bilinear", align_corners=False,
                 )
                 _gt_ssim = torch.nn.functional.interpolate(
-                    gt_image_tensor[:, :3, :, :], scale_factor=0.5, mode="bilinear", align_corners=False
+                    gt_image_tensor[:, :3, :, :],
+                    scale_factor=GPU_CFG.ssim_downsample_factor,
+                    mode="bilinear", align_corners=False,
                 )
                 ssim_loss = ssim(_img_ssim, _gt_ssim)
                 del _img_ssim, _gt_ssim
@@ -344,19 +286,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
 
-        # Pre-backward flush: on 3060 the allocator often has fragmented cached
-        # blocks that prevent the backward from finding a contiguous 64 MB slab.
-        # empty_cache() returns those blocks to CUDA so they can be re-issued as
-        # a fresh, unfragmented allocation.
-        if _IS_3060_LAPTOP:
+        # Pre-backward flush: on low-VRAM GPUs the allocator often holds
+        # fragmented cached blocks that prevent backward from finding a
+        # contiguous slab for gradient buffers.
+        if GPU_CFG.cache_clear_before_backward:
             torch.cuda.empty_cache()
-        
+
         loss.backward()
 
         # Release large forward-pass tensors immediately after backward to free
         # activation buffers before densification allocates new ones.
         del image_tensor, gt_image_tensor
-        if _IS_3060_LAPTOP:
+        if GPU_CFG.aggressive_cache_clear:
             torch.cuda.empty_cache()
 
         if torch.isnan(loss).any():
@@ -381,12 +322,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 progress_bar.close()
 
             # Periodic Python GC + CUDA cache flush.
-            # On RTX 3060 Laptop run every 50 iterations — frees Python-side
-            # cyclic garbage that holds onto CUDA tensors and returns unused
-            # cached blocks to the OS before densification can spike VRAM.
-            # On other GPUs run every 200 iterations (low overhead, insurance).
-            _gc_interval = 50 if _IS_3060_LAPTOP else 200
-            if iteration % _gc_interval == 0:
+            # Frequency is controlled by GPU_CFG.gc_interval (50 on LOW,
+            # 200 on HIGH, 500 on ULTRA) — frees Python-side cyclic garbage
+            # that holds CUDA tensors before densification can spike VRAM.
+            if iteration % GPU_CFG.gc_interval == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -422,26 +361,26 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 else:    
                     opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
                     densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
-                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < _MAX_GAUSSIANS:
+                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < GPU_CFG.max_gaussians:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
-                    if _IS_3060_LAPTOP:
+                    if GPU_CFG.aggressive_cache_clear:
                         torch.cuda.empty_cache()  # free old Gaussian tensors freed by densify
                 if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
-                    if _IS_3060_LAPTOP:
+                    if GPU_CFG.aggressive_cache_clear:
                         torch.cuda.empty_cache()  # immediately reclaim pruned Gaussian memory
-                    
+
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < _MAX_GAUSSIANS and opt.add_point:
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < GPU_CFG.max_gaussians and opt.add_point:
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
-                    if _IS_3060_LAPTOP:
+                    if GPU_CFG.aggressive_cache_clear:
                         torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
                     print("reset opacity")
                     gaussians.reset_opacity()
-                    if _IS_3060_LAPTOP:
+                    if GPU_CFG.aggressive_cache_clear:
                         torch.cuda.empty_cache()
 
             # Optimizer step
@@ -455,6 +394,16 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
     tb_writer = prepare_output_and_logger(expname)
+
+    # Apply GPU-level densification threshold override after argument parsing.
+    # On LOW-VRAM GPUs (RTX 3060): higher threshold reduces Gaussian count growth,
+    #   keeping peak VRAM and CPU-side bookkeeping arrays within budget.
+    # On ULTRA-VRAM GPUs (RTX PRO 6000): lower threshold enables more aggressive
+    #   densification, producing denser point clouds within the large VRAM budget.
+    if GPU_CFG.densify_grad_threshold_override is not None:
+        opt.densify_grad_threshold_coarse    = GPU_CFG.densify_grad_threshold_override
+        opt.densify_grad_threshold_fine_init = GPU_CFG.densify_grad_threshold_override
+        opt.densify_grad_threshold_after     = GPU_CFG.densify_grad_threshold_override
 
     GaussianModelClass = _get_gaussian_model_class(getattr(args, "model_class", None))
     gaussians = GaussianModelClass(dataset.sh_degree, hyper)
@@ -505,7 +454,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     
     # Report test and samples of training set
     if iteration in testing_iterations:
-        if not _HIGH_MEM:
+        if GPU_CFG.is_low_vram:
             torch.cuda.empty_cache()
         # 
         validation_configs = ({'name': 'test', 'cameras' : [scene.getTestCameras()[idx % len(scene.getTestCameras())] for idx in range(10, 5000, 299)]},
@@ -556,11 +505,7 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
     # ── Hardware info ────────────────────────────────────────────────────────
-    _gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    if _HIGH_MEM:
-        print(f"[hardware] {_gpu} — TF32 matmul + cudnn.benchmark + pin_memory ON")
-    else:
-        print(f"[hardware] {_gpu} — cudnn.benchmark ON  (standard precision, pin_memory OFF)")
+    log_gpu_info()
     lp = ModelParams(parser)
     pp = PipelineParams(parser)
     op = ODEOptimizationParams(parser)
