@@ -741,7 +741,16 @@ class GaussianModel:
             return
         state = torch.load(ckpt_path, map_location="cuda")
         self._hexplane.load_state_dict(state["hexplane"])
-        self._decode_mlp.load_state_dict(state["decode_mlp"])
+        # Infer trunk depth from saved keys so the MLP architecture matches the
+        # checkpoint regardless of the current default dec_D value.
+        mlp_sd = state["decode_mlp"]
+        trunk_linear_keys = [k for k in mlp_sd if k.startswith("trunk.") and k.endswith(".weight")]
+        saved_D = len(trunk_linear_keys) - 1  # first Linear is always present; each extra loop adds one more
+        if saved_D != (self._decode_mlp.trunk.__len__() - 1) // 2:
+            feat_dim = mlp_sd["trunk.0.weight"].shape[1]
+            W = mlp_sd["trunk.0.weight"].shape[0]
+            self._decode_mlp = _HexDecodeMLP(feat_dim=feat_dim, W=W, D=saved_D).cuda()
+        self._decode_mlp.load_state_dict(mlp_sd)
         self._hexplane  = self._hexplane.cuda()
         self._decode_mlp = self._decode_mlp.cuda()
         if os.path.exists(os.path.join(path, "deformation_table.pth")):
