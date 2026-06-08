@@ -566,6 +566,12 @@ class GaussianModel:
             print(f"[FourierApprox] No fourier_deformation.pth found at {path}")
             return
         state = torch.load(ckpt_path, map_location="cuda")
+        # Restore K from checkpoint so _fourier_basis produces the matching basis size.
+        if "K" in state:
+            self.K = int(state["K"])
+        else:
+            # Infer K from the saved tensor shape (2K, …)
+            self.K = state["fourier_pos"].shape[1] // 2
         self._fourier_pos   = nn.Parameter(state["fourier_pos"].cuda())
         self._fourier_rot   = nn.Parameter(state["fourier_rot"].cuda())
         self._fourier_scale = nn.Parameter(state["fourier_scale"].cuda())
