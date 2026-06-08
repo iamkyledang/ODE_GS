@@ -504,11 +504,16 @@ class GaussianModel:
         self._opacity        = optimizable_tensors["opacity"]
         self._scaling        = optimizable_tensors["scaling"]
         self._rotation       = optimizable_tensors["rotation"]
+        num_new = new_xyz.shape[0]
         new_N = self.get_xyz.shape[0]
         self.xyz_gradient_accum  = torch.zeros((new_N, 1), device="cuda")
         self._deformation_accum  = torch.zeros((new_N, 3), device="cuda")
         self.denom               = torch.zeros((new_N, 1), device="cuda")
         self.max_radii2D         = torch.zeros((new_N,),   device="cuda")
+        self._deformation_table  = torch.cat([
+            self._deformation_table,
+            torch.ones(num_new, dtype=torch.bool, device="cuda"),
+        ], dim=0)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_pts  = self._xyz.shape[0]
