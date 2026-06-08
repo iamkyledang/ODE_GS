@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
@@ -41,20 +42,37 @@ class _Tier:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal detection helpers
+# Internal detection helpers (nvidia-smi only — no CUDA init at import time)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _nvidia_smi_query(fields: str):
+    """Run nvidia-smi for device 0 and return a list of field values.
+    Returns an empty list if nvidia-smi is unavailable or fails."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=' + fields, '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().splitlines()
+            return [v.strip() for v in lines[0].split(',')]
+        return []
+    except Exception:
+        return []
+
+
 def _get_gpu_name() -> str:
-    if not torch.cuda.is_available():
-        return ""
-    return torch.cuda.get_device_name(0)
+    vals = _nvidia_smi_query("name")
+    return vals[0] if vals else ""
 
 
 def _get_vram_gb() -> float:
-    """Total VRAM in GiB for device 0."""
-    if not torch.cuda.is_available():
+    """Total VRAM in GiB for device 0 (nvidia-smi reports in MiB)."""
+    vals = _nvidia_smi_query("memory.total")
+    try:
+        return int(vals[0]) / 1024.0 if vals else 0.0
+    except (ValueError, IndexError):
         return 0.0
-    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
 
 def _detect_tier(name: str, vram_gb: float) -> str:
@@ -81,11 +99,15 @@ def _detect_tier(name: str, vram_gb: float) -> str:
 
 
 def _is_ampere_or_newer() -> bool:
-    """True for Ampere (CC >= 8) or newer — RTX 3060/4090/RTX PRO 6000 all qualify."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability(0)
-    return major >= 8
+    """True for Ampere (CC >= 8) or newer, inferred from GPU name.
+    Uses nvidia-smi so no CUDA initialisation happens at import time."""
+    name = _get_gpu_name().lower()
+    # RTX 30xx = Ampere, RTX 40xx = Ada Lovelace, RTX PRO 6000 / RTX 6000 Ada,
+    # A100, H100, H200, B100 are all Ampere or newer.
+    return any(x in name for x in (
+        "rtx 30", "rtx 40", "rtx pro 6000", "rtx 6000 ada",
+        "a100", "h100", "h200", "b100",
+    ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,19 +410,29 @@ def apply_torch_global_settings() -> None:
     if GPU_CFG.cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", GPU_CFG.cuda_alloc_conf)
 
-    if not torch.cuda.is_available():
-        return
-
-    # cuDNN auto-tunes convolution algorithms per observed input shape —
-    # free throughput for any fixed-size conv workload.
-    torch.backends.cudnn.benchmark = True
+    # These are attribute writes only — they do NOT call cudaGetDeviceCount() or
+    # any other CUDA API, so they are safe to set before safe_state() /
+    # torch.cuda.set_device().  Skip silently on old PyTorch that lacks an attr.
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
 
     if GPU_CFG.is_ampere:
         # TF32 matmul: ~1.5–3× faster on Ampere / Ada / Blackwell vs full FP32,
         # with < 0.1% numerical error.  Safe for Gaussian splatting training.
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32       = True
+        try:
+            torch.set_float32_matmul_precision("high")  # added PyTorch 1.12
+        except AttributeError:
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,7 +448,7 @@ _TIER_LABEL = {
 
 def log_gpu_info() -> None:
     """Print a one-line hardware summary to stdout."""
-    if not torch.cuda.is_available():
+    if not GPU_CFG.gpu_name:
         print("[gpu] No CUDA device — running on CPU.")
         return
     cfg = GPU_CFG
