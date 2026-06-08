@@ -396,23 +396,32 @@ def apply_torch_global_settings() -> None:
     """
     Apply all hardware-specific PyTorch and CUDA global settings.
 
-    MUST be called before the first torch.cuda tensor allocation so that
-    PYTORCH_CUDA_ALLOC_CONF is read by the caching allocator at its first
-    initialisation.  Idempotent — safe to call more than once.
+    Preferred usage in entry-points (train.py, render.py):
+      1. Set PYTORCH_CUDA_ALLOC_CONF early (before first CUDA allocation):
+             import os; os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", GPU_CFG.cuda_alloc_conf)
+      2. Call apply_torch_backend_settings() AFTER safe_state() / torch.cuda.set_device()
+             to avoid triggering a sticky CUDA error on Python 3.7 era PyTorch.
 
-    Settings applied:
-      • PYTORCH_CUDA_ALLOC_CONF  (via os.environ.setdefault)
-      • torch.backends.cudnn.benchmark
-      • torch.set_float32_matmul_precision("high")  [Ampere / Ada / Blackwell]
-      • torch.backends.cuda.matmul.allow_tf32        [same]
-      • torch.backends.cudnn.allow_tf32              [same]
+    This combined function is kept for callers that do not use safe_state()
+    (full_eval.py, metrics.py) and for backward compatibility.  Idempotent.
     """
     if GPU_CFG.cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", GPU_CFG.cuda_alloc_conf)
+    apply_torch_backend_settings()
 
-    # These are attribute writes only — they do NOT call cudaGetDeviceCount() or
-    # any other CUDA API, so they are safe to set before safe_state() /
-    # torch.cuda.set_device().  Skip silently on old PyTorch that lacks an attr.
+
+def apply_torch_backend_settings() -> None:
+    """
+    Apply cuDNN-benchmark and TF32 backend flags.
+
+    MUST be called AFTER safe_state() / torch.cuda.set_device() has
+    successfully initialised the CUDA context.  On Python 3.7 era PyTorch,
+    accessing torch.backends.cuda.matmul before CUDA is ready can probe
+    cudaGetDeviceCount() and leave a sticky Error-304 that causes the
+    confusing "Did you run some CUDA functions before calling NumCudaDevices()"
+    message.  Calling this after safe_state() avoids that race.
+    Idempotent — safe to call more than once.
+    """
     try:
         torch.backends.cudnn.benchmark = True
     except Exception:

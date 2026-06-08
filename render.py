@@ -52,8 +52,10 @@ def _get_gaussian_model_class(model_class: str):
 from time import time
 import threading
 import concurrent.futures
-from gpu import GPU_CFG, apply_torch_global_settings
-apply_torch_global_settings()
+from gpu import GPU_CFG, apply_torch_backend_settings
+import os
+if GPU_CFG.cuda_alloc_conf:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", GPU_CFG.cuda_alloc_conf)
 
 def lerp(a, b, alpha):
     return (1.0 - alpha) * a + alpha * b
@@ -450,7 +452,24 @@ if __name__ == "__main__":
     if not hasattr(args, "model_class"):
         args.model_class = "ode"
 
+    # CUDA pre-flight: catch Error 304 (cudaErrorOperatingSystem) early.
+    # Common cause: Docker container started without --gpus all.
+    try:
+        _cuda_ok = torch.cuda.is_available()
+    except Exception:
+        _cuda_ok = False
+    if not _cuda_ok:
+        import sys
+        print(
+            "[ERROR] CUDA device not accessible.\n"
+            "  Most likely cause: Docker container started without GPU support.\n"
+            "  Fix: docker run --gpus all  (or --runtime=nvidia)"
+        )
+        sys.exit(1)
+
     safe_state(args.quiet)
+    # Apply TF32 / cuDNN-benchmark flags AFTER CUDA context is initialised.
+    apply_torch_backend_settings()
 
     render_sets(
         model.extract(args),

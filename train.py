@@ -15,8 +15,14 @@ import os, sys
 # ── Unified GPU configuration (must be imported before first CUDA allocation).
 # gpu.py detects the hardware tier (LOW / HIGH / ULTRA) and provides all
 # hardware-specific tuning knobs in one place.
-from gpu import GPU_CFG, apply_torch_global_settings, log_gpu_info
-apply_torch_global_settings()   # sets PYTORCH_CUDA_ALLOC_CONF + TF32 flags
+from gpu import GPU_CFG, apply_torch_global_settings, apply_torch_backend_settings, log_gpu_info
+# Set PYTORCH_CUDA_ALLOC_CONF env-var NOW (must be before the first CUDA memory
+# allocation).  Backend flags (TF32, cuDNN benchmark) are applied AFTER
+# safe_state() initialises the CUDA context to avoid triggering a sticky CUDA
+# error on older PyTorch / Python 3.7 builds.
+import os
+if GPU_CFG.cuda_alloc_conf:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", GPU_CFG.cuda_alloc_conf)
 
 import gc
 import torch
@@ -501,7 +507,6 @@ def setup_seed(seed):
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
     # ── Hardware info ────────────────────────────────────────────────────────
@@ -536,7 +541,27 @@ if __name__ == "__main__":
 
     print("Optimizing " + args.model_path)
 
+    # ── CUDA pre-flight check ─────────────────────────────────────────────────
+    # Catch Error 304 (cudaErrorOperatingSystem) early and give a clear message.
+    # The most common cause in Docker is a missing --gpus all flag.
+    try:
+        _cuda_ok = torch.cuda.is_available()
+    except Exception:
+        _cuda_ok = False
+    if not _cuda_ok:
+        print(
+            "[ERROR] CUDA device not accessible.\n"
+            "  Most likely cause: Docker container started without GPU support.\n"
+            "  Fix: docker run --gpus all  (or --runtime=nvidia)\n"
+            "  Verify: nvidia-smi inside the container should list your GPU."
+        )
+        sys.exit(1)
+
     safe_state(args.quiet)
+    # Apply TF32 / cuDNN-benchmark flags AFTER CUDA context is initialised to
+    # avoid setting a sticky CUDA error on old PyTorch (Python 3.7 era).
+    apply_torch_backend_settings()
+    torch.cuda.empty_cache()
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args),
