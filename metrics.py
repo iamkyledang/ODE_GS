@@ -192,6 +192,21 @@ def _infer_camera_groups(pairs):
     return {"cam00": pairs}
 
 
+def _pad_to_divisible(t, factor=8):
+    """Pad tensor (B, C, H, W) so H and W are divisible by *factor* (reflect-pad).
+
+    Returns (padded_tensor, (pad_h, pad_w)) so callers can crop flow back.
+    """
+    import torch.nn.functional as F
+    h, w = t.shape[-2], t.shape[-1]
+    pad_h = (factor - h % factor) % factor
+    pad_w = (factor - w % factor) % factor
+    if pad_h == 0 and pad_w == 0:
+        return t, (0, 0)
+    # F.pad order: (left, right, top, bottom)
+    return F.pad(t, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
+
+
 def compute_flow_error(renders_dir, gt_dir):
     """
     Compare optical flow between consecutive rendered and GT frame pairs.
@@ -220,9 +235,19 @@ def compute_flow_error(renders_dir, gt_dir):
             g_a = _to_tensor(cam_pairs[i][1]);      g_b = _to_tensor(cam_pairs[i + 1][1])
             r_a_t, r_b_t = tfm(r_a, r_b)
             g_a_t, g_b_t = tfm(g_a, g_b)
+            r_a_t, (ph, pw) = _pad_to_divisible(r_a_t)
+            r_b_t, _        = _pad_to_divisible(r_b_t)
+            g_a_t, _        = _pad_to_divisible(g_a_t)
+            g_b_t, _        = _pad_to_divisible(g_b_t)
             with torch.no_grad():
                 flow_r = raft(r_a_t, r_b_t)[-1]
                 flow_g = raft(g_a_t, g_b_t)[-1]
+            # Crop padding from flow outputs before computing EPE
+            if ph > 0 or pw > 0:
+                h_orig = flow_r.shape[-2] - ph
+                w_orig = flow_r.shape[-1] - pw
+                flow_r = flow_r[..., :h_orig, :w_orig]
+                flow_g = flow_g[..., :h_orig, :w_orig]
             err = (flow_r - flow_g).norm(dim=1).mean().item()  # EPE
             cam_errors.append(err)
             all_errors.append(err)

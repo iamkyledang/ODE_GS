@@ -300,12 +300,15 @@ def is_rendering_done(method: str, scene: str, output_root: str) -> bool:
     return False
 
 
-def is_metrics_done(method: str, scene: str, output_root: str) -> bool:
+def is_metrics_done(method: str, scene: str, output_root: str, eval_flow: bool = False) -> bool:
     """
     Metrics are done when results.json contains at least one key whose value is
     a dict (an actual metric result sub-object).  Top-level scalar fields added
     by _patch_results_json (training_time_s, render_time_s, …) are intentionally
     ignored so a partially-written file is not mistaken for complete metrics.
+
+    When eval_flow=True, also requires that at least one result sub-dict
+    contains 'flow_EPE_mean', so a run whose flow crashed will be re-evaluated.
     """
     results = Path(output_root) / method / scene / "results.json"
     if not results.exists():
@@ -313,7 +316,12 @@ def is_metrics_done(method: str, scene: str, output_root: str) -> bool:
     try:
         with open(results) as f:
             data = json.load(f)
-        return any(isinstance(v, dict) for v in data.values())
+        metric_dicts = [v for v in data.values() if isinstance(v, dict)]
+        if not metric_dicts:
+            return False
+        if eval_flow and not any("flow_EPE_mean" in d for d in metric_dicts):
+            return False
+        return True
     except (json.JSONDecodeError, OSError):
         return False
 
@@ -798,9 +806,13 @@ if __name__ == "__main__":
     parser.add_argument("--skip_training",    action="store_true")
     parser.add_argument("--skip_rendering",   action="store_true")
     parser.add_argument("--skip_metrics",     action="store_true")
-    parser.add_argument("--eval_flow",        action="store_true",
-                        help="Include optical-flow EPE in metrics (requires RAFT).")
+    parser.add_argument("--eval_flow",        action="store_true", default=True,
+                        help="Include optical-flow EPE in metrics (default: on). Use --no_eval_flow to disable.")
+    parser.add_argument("--no_eval_flow",     action="store_true",
+                        help="Disable optical-flow EPE evaluation.")
     args = parser.parse_args()
+    if args.no_eval_flow:
+        args.eval_flow = False
 
     # Resolve --method (single shorthand) → args.methods
     if args.method is not None:
@@ -844,7 +856,7 @@ if __name__ == "__main__":
     if not args.skip_metrics:
         for method in args.methods:
             for scene in args.scenes:
-                if is_metrics_done(method, scene, args.output_root):
+                if is_metrics_done(method, scene, args.output_root, eval_flow=args.eval_flow):
                     print(f"\n[metrics] SKIP {method}/{scene}  (results.json already exists)")
                 else:
                     run_metrics(method, scene, args.output_root, eval_flow=args.eval_flow)
