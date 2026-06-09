@@ -508,7 +508,12 @@ def setup_seed(seed):
      torch.backends.cudnn.deterministic = True
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    setup_seed(6666)
+    # NOTE: setup_seed is called AFTER safe_state() below.  Calling
+    # torch.cuda.manual_seed_all() before the CUDA context is fully
+    # initialised (via safe_state → torch.cuda.set_device) can leave the
+    # driver in a sticky error state (Error 304) that makes the subsequent
+    # safe_state call fail — most visibly when os.execv restarts training
+    # after a NaN loss.
     # ── Hardware info ────────────────────────────────────────────────────────
     log_gpu_info()
     lp = ModelParams(parser)
@@ -558,6 +563,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     safe_state(args.quiet)
+    setup_seed(6666)   # seed AFTER CUDA context is established (avoids Error 304)
     # Apply TF32 / cuDNN-benchmark flags AFTER CUDA context is initialised to
     # avoid setting a sticky CUDA error on old PyTorch (Python 3.7 era).
     apply_torch_backend_settings()
