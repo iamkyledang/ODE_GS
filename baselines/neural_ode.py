@@ -145,8 +145,11 @@ def _euler_integrate(
         t_enc = poc_fre(t_buf, t_freq_buf)                        # (1, t_ch)
         vx, vr, vs = vel_net(x_enc, t_enc)
         x = x + dt * vx
-        s = s + dt * vs
-        r = r + dt * vr
+        # Clamp log-scales: prevents exp() overflow → NaN in the rasteriser.
+        s = torch.clamp(s + dt * vs, -10.0, 10.0)
+        # Normalise after each step: F.normalize(zero-vector) = NaN, so keeping
+        # the quaternion near unit-norm is critical for fine-training stability.
+        r = torch.nn.functional.normalize(r + dt * vr, dim=-1)
 
     return x, s, r
 
@@ -309,7 +312,10 @@ class GaussianModel:
             t_freq_buf=self.register_buffer_time_freqs,
             xyz0=self._xyz,
             scale0=self._scaling,
-            rot0=self._rotation,
+            # Use normalised rotation as the integration start so the canonical
+            # quaternion is always a proper unit quaternion even if the raw
+            # parameter drifts slightly away from the unit sphere during Adam updates.
+            rot0=torch.nn.functional.normalize(self._rotation, dim=-1),
             t_end=t_val,
             n_steps=self._ode_steps,
         )
