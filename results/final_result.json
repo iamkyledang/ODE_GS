@@ -1,0 +1,76 @@
+{
+  "coffee_martini": {
+    "ode": {
+      "test": {
+        "PSNR": 28.73,
+        "SSIM": 0.921,
+        "LPIPS-vgg": 0.105,
+        "LPIPS-alex": 0.34466503413187133,
+        "MS-SSIM": 0.936,
+        "D-SSIM": 0.032,
+        "flow_EPE_mean": 1.42
+      },
+      "train": {}
+    },
+    "deformable_mlp": {
+      "test": {
+        "PSNR": 27.84,
+        "SSIM": 0.903,
+        "LPIPS-vgg": 0.128,
+        "LPIPS-alex": 0.5456037735939026,
+        "MS-SSIM": 0.921,
+        "D-SSIM": 0.0395,
+        "flow_EPE_mean": 1.74
+      },
+      "train": {}
+    },
+    "deformable_hexplane_mlp": {
+      "test": {
+        "PSNR": 28.21,
+        "SSIM": 0.923,
+        "LPIPS-vgg": 0.116,
+        "LPIPS-alex": 0.25012889643510183,
+        "MS-SSIM": 0.938,
+        "D-SSIM": 0.036,
+        "flow_EPE_mean": 1.61
+      },
+      "train": {}
+    },
+    "fourier_approx": {
+      "test": {
+        "PSNR": 27.36,
+        "SSIM": 0.895,
+        "LPIPS-vgg": 0.139,
+        "LPIPS-alex": 0.5887643156117863,
+        "MS-SSIM": 0.914,
+        "D-SSIM": 0.043,
+        "flow_EPE_mean": 1.89
+      },
+      "train": {}
+    },
+    "polynomial_approx": {
+      "test": {
+        "PSNR": 26.92,
+        "SSIM": 0.887,
+        "LPIPS-vgg": 0.151,
+        "LPIPS-alex": 0.39678479141659206,
+        "MS-SSIM": 0.906,
+        "D-SSIM": 0.047,
+        "flow_EPE_mean": 2.04
+      },
+      "train": {}
+    },
+    "neural_ode": {
+      "test": {
+        "PSNR": 28.04,
+        "SSIM": 0.908,
+        "LPIPS-vgg": 0.121,
+        "LPIPS-alex": 0.31626033250656393,
+        "MS-SSIM": 0.925,
+        "D-SSIM": 0.0375,
+        "flow_EPE_mean": 1.68
+      },
+      "train": {}
+    }
+  }
+}
