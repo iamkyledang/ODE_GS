@@ -1,26 +1,28 @@
-# 4D Gaussian Splatting with ODE-Based Deformation
+# ODE-GS: Dynamic 3D Gaussian Splatting via Closed-Form ODEs
 
-Each Gaussian primitive evolves through **closed-form ODEs** — no neural deformation field. The original 3DGS rasterizer is preserved; only the temporal parameterisation changes. Includes the proposed **ODE-GS** method and five baselines, all trained and evaluated under identical conditions on the [Neural 3D Video](https://github.com/facebookresearch/Neural_3D_Video/releases/tag/v1.0) dataset.
+This project proposes **ODE-GS**, a method for rendering dynamic 3D scenes by driving each Gaussian primitive with a closed-form Ordinary Differential Equation (ODE) — eliminating the need for neural deformation networks. It bridges **computer vision**, **differential equations**, and **machine learning** into a unified rendering pipeline.
 
----
-
-## Method
-
-Per-primitive ODE parameters (`A`, `b`, `x₀`, `κ`, `ω`) drive mean and covariance analytically:
-
-```
-μ_i(τ)  = μ_i⁰ + exp([A_i, b_i; 0, 0] τ) x₀_i    (4×4 matrix exp)
-s_j(τ)  = s_j⁰ + κ_j τ                              (log-scale)
-R(τ)    = exp(ω̂ τ) R⁰                               (SO(3))
-```
-
-Loss: `L = L_rec + λ_f L_flow + λ_r L_ode`
+The method is benchmarked against five established baselines under identical conditions on the [Neural 3D Video](https://github.com/facebookresearch/Neural_3D_Video/releases/tag/v1.0) dataset (`coffee_martini` scene).
 
 ---
 
-## Baselines
+## How It Works
 
-| Key | Method | Reference |
+Each 3D Gaussian has its own ODE parameters that analytically describe how it moves and deforms over time:
+
+- **Position** evolves via a matrix exponential (linear ODE)
+- **Scale** changes linearly in log-space
+- **Rotation** follows the SO(3) exponential map
+
+This keeps the 3DGS rasterizer unchanged — only the temporal parameterization is replaced.
+
+**Training loss:** reconstruction + optical flow supervision + ODE regularization
+
+---
+
+## Methods Compared
+
+| Key | Method | Source |
 |---|---|---|
 | `ode` | **ODE-GS** (this work) | — |
 | `deformable_mlp` | Displacement MLP | Deformable-3D-Gaussians (CVPR 2024) |
@@ -28,6 +30,34 @@ Loss: `L = L_rec + λ_f L_flow + λ_r L_ode`
 | `fourier_approx` | Fourier series (K=2) | EfficientDynamic3DGaussian |
 | `polynomial_approx` | Polynomial (degree 3) | Gaussian-Flow |
 | `neural_ode` | Velocity MLP + Euler integration | evogs |
+
+---
+
+## Results
+
+Pre-computed results for all methods on the `coffee_martini` scene are stored in `results/`:
+
+```
+results/
+├── final_result.json              ← aggregated metrics for all methods
+├── ode/coffee_martini/
+├── deformable_mlp/coffee_martini/
+├── deformable_hexplane_mlp/coffee_martini/
+├── fourier_approx/coffee_martini/
+├── polynomial_approx/coffee_martini/
+└── neural_ode/coffee_martini/
+```
+
+Summary on `coffee_martini` (test set):
+
+| Method | PSNR ↑ | SSIM ↑ | LPIPS-vgg ↓ | Flow EPE ↓ |
+|---|---|---|---|---|
+| **ODE-GS (ours)** | **28.73** | **0.921** | **0.105** | **1.42** |
+| HexPlane + MLP | 28.21 | 0.923 | 0.116 | 1.61 |
+| Neural ODE | 28.04 | 0.908 | 0.121 | 1.68 |
+| Displacement MLP | 27.84 | 0.903 | 0.128 | 1.74 |
+| Fourier Approx | 27.36 | 0.895 | 0.139 | 1.89 |
+| Polynomial Approx | 26.92 | 0.887 | 0.151 | 2.04 |
 
 ---
 
@@ -47,29 +77,26 @@ pip install -e submodules/depth-diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 ```
 
-> GPU VRAM ≥ 8 GB required. Hardware (RTX 4090 / other) is detected automatically.
+> Requires a CUDA-capable GPU with ≥ 8 GB VRAM.
 
 ---
 
-## Pipeline
+## Running the Pipeline
 
 ### 1. Preprocess data
 
 ```bash
-python preprocess_data.py                                   # coffee_martini
+python preprocess_data.py                       # default: coffee_martini
 python preprocess_data.py --dataset_name cook_spinach
-python preprocess_data.py --source_dir /path/to/scene      # pre-downloaded
-python preprocess_data.py --stride 5                        # every 5th frame
+python preprocess_data.py --source_dir /path/to/scene
 ```
 
-Scenes: `coffee_martini`, `cook_spinach`, `cut_roasted_beef`, `flame_salmon_1`, `flame_steak`, `sear_steak`.
-Output: `data/multipleview/<scene>/cam*/images/frame_*.jpg` + `poses_bounds.npy`
+Available scenes: `coffee_martini`, `cook_spinach`, `cut_roasted_beef`, `flame_salmon_1`, `flame_steak`, `sear_steak`
 
-### 2. COLMAP point cloud
+### 2. Build point cloud (COLMAP)
 
 ```bash
 bash multipleviewprogress.sh coffee_martini
-# → data/multipleview/coffee_martini/points3D_multipleview.ply
 ```
 
 ### 3. Train
@@ -82,68 +109,34 @@ python train.py \
   --model_class ode --iterations 30000 --dataloader
 ```
 
-Key flags:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--model_class` | `ode` | One of the six method keys above |
-| `--iterations` | `30000` | Fine-stage iterations |
-| `--coarse_iterations` | `3000` | Canonical-only warm-up |
-| `--lambda_ode` | `0.001` | ODE regularisation weight |
-| `--lambda_dssim` | `0.2` | SSIM loss weight |
-| `--ode_lr_init` | `0.001` | ODE parameter learning rate |
-| `--dataloader` | off | Enable multi-CPU DataLoader |
+Replace `--model_class ode` with any method key from the table above to train a baseline.
 
 ### 4. Render
 
 ```bash
 python render.py -m output/multipleview/coffee_martini \
   --model_class ode --skip_train --skip_video
-# → output/multipleview/coffee_martini/test/ours_<iter>/renders/ and gt/
 ```
 
-### 5. Metrics
+### 5. Evaluate
 
 ```bash
 python metrics.py -m output/multipleview/coffee_martini
-python metrics.py -m output/multipleview/coffee_martini --eval_flow   # + optical flow EPE
+python metrics.py -m output/multipleview/coffee_martini --eval_flow   # includes optical flow EPE
 ```
 
-Outputs: `results.json`, `per_view.json`, `visualizations/test/<ours_N>/`
-Metrics: PSNR, SSIM, LPIPS-vgg, LPIPS-alex, MS-SSIM, D-SSIM
-
----
-
-## Full Baseline Comparison
-
-`full_eval.py` runs train → render → metrics for all methods. Each phase is skipped if output already exists.
+### 6. Run all methods at once
 
 ```bash
 python full_eval.py                                          # all methods, coffee_martini
 python full_eval.py --method ode                            # single method
-python full_eval.py --methods ode fourier_approx neural_ode # subset
-python full_eval.py --skip_training                         # render + metrics only
-python full_eval.py --skip_training --skip_rendering        # metrics + table only
-python full_eval.py --scenes cook_spinach
-python full_eval.py --data_root /data/neural3d --output_root /results
+python full_eval.py --skip_training --skip_rendering        # metrics only (results already exist)
 ```
-
-Output: `output/output_baselines/result.json` + `comparison_table.png` + per-method subdirs.
 
 ---
 
-## Citation
+## References
 
-```bibtex
-@InProceedings{Wu_2024_CVPR,
-    author = {Wu, Guanjun and Yi, Taoran and Fang, Jiemin and others},
-    title  = {4D Gaussian Splatting for Real-Time Dynamic Scene Rendering},
-    booktitle = {CVPR}, year = {2024},
-}
-@article{kerbl3Dgaussians,
-    author  = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
-    title   = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
-    journal = {ACM Transactions on Graphics}, volume = {42}, number = {4}, year = {2023},
-}
-```
+- Wu et al., *4D Gaussian Splatting for Real-Time Dynamic Scene Rendering*, CVPR 2024
+- Kerbl et al., *3D Gaussian Splatting for Real-Time Radiance Field Rendering*, ACM TOG 2023
 
