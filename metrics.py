@@ -207,6 +207,26 @@ def _pad_to_divisible(t, factor=8):
     return F.pad(t, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
 
 
+def _resize_for_raft(t, max_side):
+    """Downscale tensor (B, C, H, W) so its longer side ≤ max_side, snapped to
+    the nearest multiple of 8 (RAFT requirement).  Returns (resized, scale)
+    where scale = new_h / orig_h.  EPE values must be divided by scale to
+    convert back to original-resolution pixel units.
+    If max_side is None or the image already fits, returns (t, 1.0) unchanged.
+    """
+    import torch.nn.functional as F
+    if max_side is None:
+        return t, 1.0
+    h, w = t.shape[-2], t.shape[-1]
+    if max(h, w) <= max_side:
+        return t, 1.0
+    scale = max_side / max(h, w)
+    new_h = max(8, int(h * scale) // 8 * 8)
+    new_w = max(8, int(w * scale) // 8 * 8)
+    resized = F.interpolate(t.float(), size=(new_h, new_w), mode="bilinear", align_corners=False)
+    return resized, new_h / h
+
+
 def compute_flow_error(renders_dir, gt_dir):
     """
     Compare optical flow between consecutive rendered and GT frame pairs.
@@ -228,6 +248,7 @@ def compute_flow_error(renders_dir, gt_dir):
     per_camera_errors = {}
     all_errors = []
 
+    max_side = GPU_CFG.flow_max_side
     for cam_name, cam_pairs in cam_groups.items():
         cam_errors = []
         for i in tqdm(range(len(cam_pairs) - 1), desc=f"Flow [{cam_name}]"):
@@ -235,6 +256,11 @@ def compute_flow_error(renders_dir, gt_dir):
             g_a = _to_tensor(cam_pairs[i][1]);      g_b = _to_tensor(cam_pairs[i + 1][1])
             r_a_t, r_b_t = tfm(r_a, r_b)
             g_a_t, g_b_t = tfm(g_a, g_b)
+            # Resize to fit GPU memory before RAFT (RAFT memory is O(H²×W²))
+            r_a_t, epe_scale = _resize_for_raft(r_a_t, max_side)
+            r_b_t, _         = _resize_for_raft(r_b_t, max_side)
+            g_a_t, _         = _resize_for_raft(g_a_t, max_side)
+            g_b_t, _         = _resize_for_raft(g_b_t, max_side)
             r_a_t, (ph, pw) = _pad_to_divisible(r_a_t)
             r_b_t, _        = _pad_to_divisible(r_b_t)
             g_a_t, _        = _pad_to_divisible(g_a_t)
@@ -248,7 +274,8 @@ def compute_flow_error(renders_dir, gt_dir):
                 w_orig = flow_r.shape[-1] - pw
                 flow_r = flow_r[..., :h_orig, :w_orig]
                 flow_g = flow_g[..., :h_orig, :w_orig]
-            err = (flow_r - flow_g).norm(dim=1).mean().item()  # EPE
+            # Scale EPE back to original-resolution pixel units
+            err = (flow_r - flow_g).norm(dim=1).mean().item() / epe_scale  # EPE
             cam_errors.append(err)
             all_errors.append(err)
             if GPU_CFG.metrics_cache_clear == "per_image":

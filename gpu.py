@@ -154,8 +154,12 @@ class GPUConfig:
     # ── Metrics ───────────────────────────────────────────────────────────────
     # lpips_on_gpu: run LPIPS networks on CUDA (True) or CPU (False).
     # metrics_cache_clear: "per_image" | "per_camera" | "end_only"
+    # flow_max_side: RAFT input images are resized so their longer side ≤ this
+    #   value before optical-flow inference.  None = no resize (full resolution).
+    #   RAFT memory is O(H²×W²) so even modest downscaling cuts VRAM sharply.
     lpips_on_gpu:        bool = True
     metrics_cache_clear: str  = "per_image"
+    flow_max_side:       Optional[int] = 768
 
     # ── Garbage collection / cache flush ─────────────────────────────────────
     # gc_interval: iterations between gc.collect() + torch.cuda.empty_cache().
@@ -242,6 +246,7 @@ def _build_config() -> GPUConfig:
 
             lpips_on_gpu        = False,
             metrics_cache_clear = "per_image",
+            flow_max_side       = 512,
 
             gc_interval                 = 50,
             aggressive_cache_clear      = True,
@@ -306,6 +311,7 @@ def _build_config() -> GPUConfig:
 
             lpips_on_gpu        = True,
             metrics_cache_clear = "per_camera",
+            flow_max_side       = 768,
 
             gc_interval                 = 200,
             aggressive_cache_clear      = False,
@@ -367,6 +373,7 @@ def _build_config() -> GPUConfig:
 
             lpips_on_gpu        = True,
             metrics_cache_clear = "end_only",
+            flow_max_side       = 1024,
 
             gc_interval                 = 500,
             aggressive_cache_clear      = False,
